@@ -1,0 +1,24 @@
+# Arquivos de Dados
+*.csv
+*.parquet
+*.json
+*.data
+
+# Ambiente Virtual
+venv/
+.venv/
+
+# Cache do Python
+__pycache__/
+*.pyc
+
+# Arquivos do Jupyter Notebook
+.ipynb_checkpoints
+
+# Configuração de IDEs
+.vscode/
+.idea/
+
+# Arquivos de Sistema Operacional
+.DS_Store
+Thumbs.db
