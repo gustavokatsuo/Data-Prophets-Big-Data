@@ -6,3 +6,5 @@ seaborn
 fastparquet
 lightgbm
 scikit-learn
+scipy
+notebook
