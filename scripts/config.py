@@ -49,6 +49,15 @@ PLOT_CONFIG = {
     'palette': 'husl'
 }
 
+# Parâmetros de detecção e tratamento de outliers
+OUTLIER_PARAMS = {
+    'rolling_window': 12,
+    'z_threshold': 2.5,           # Threshold mais agressivo para detectar outliers
+    'treatment': 'cap',           # Capping é mais efetivo para outliers extremos
+    'adaptive_threshold': True,   # Ajusta threshold baseado nas características do grupo
+    'min_observations': 10        # Mínimo de observações para estatísticas confiáveis
+}
+
 # Configurações de processamento
 PROCESSING_CONFIG = {
     'max_workers': cpu_count(),

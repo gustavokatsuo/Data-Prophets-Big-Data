@@ -4,7 +4,7 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from config import PLOT_CONFIG
+from .config import PLOT_CONFIG
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -68,7 +68,7 @@ class DataVisualizer:
         non_zero_pct = 100 - zero_pct
         axes[1, 1].pie([zero_pct, non_zero_pct], labels=['Vendas = 0', 'Vendas > 0'], 
                        autopct='%1.1f%%', colors=['lightgray', 'skyblue'])
-        axes[1, 1].set_title(f'🎯 Distribuição Zero-Inflated\\n({zero_pct:.1f}% zeros)')
+        axes[1, 1].set_title(f'🎯 Distribuição Zero-Inflated\n({zero_pct:.1f}% zeros)')
         
         # 6. Sazonalidade temporal
         if 'mes' in df_raw.columns:
@@ -99,9 +99,23 @@ class DataVisualizer:
         """Plota resultados do treinamento e feature importance"""
         print("🎯 Analisando resultados do treinamento...")
         
-        # Predições
-        train_pred = model.predict(X_train, num_iteration=model.best_iteration)
-        val_pred = model.predict(X_val, num_iteration=model.best_iteration)
+        # Predições usando nossa classe wrapper
+        if hasattr(model, 'model'):
+            # É nossa classe LightGBMModel
+            train_pred = model.predict(X_train)
+            val_pred = model.predict(X_val)
+            lgb_model = model.model
+            best_iteration = model.best_iteration
+        else:
+            # É o modelo do LightGBM diretamente
+            try:
+                train_pred = model.predict(X_train, num_iteration=model.best_iteration)
+                val_pred = model.predict(X_val, num_iteration=model.best_iteration)
+            except TypeError:
+                train_pred = model.predict(X_train, iteration=model.best_iteration)
+                val_pred = model.predict(X_val, iteration=model.best_iteration)
+            lgb_model = model
+            best_iteration = model.best_iteration
         
         # Criar figura
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -110,7 +124,7 @@ class DataVisualizer:
         # 1. Feature Importance
         feature_imp = pd.DataFrame({
             'feature': features,
-            'importance': model.feature_importance(importance_type='gain')
+            'importance': lgb_model.feature_importance(importance_type='gain')
         }).sort_values('importance', ascending=False).head(15)
         
         axes[0, 0].barh(range(len(feature_imp)), feature_imp['importance'], color='steelblue')
@@ -184,7 +198,7 @@ class DataVisualizer:
     
     def print_data_stats(self, stats):
         """Imprime estatísticas descritivas dos dados"""
-        print("\\n📈 ESTATÍSTICAS DESCRITIVAS:")
+        print("\n📈 ESTATÍSTICAS DESCRITIVAS:")
         print(f"• Total de registros: {stats['total_records']:,}")
         print(f"• PDVs únicos: {stats['unique_pdvs']:,}")
         print(f"• Produtos únicos: {stats['unique_products']:,}")
@@ -205,7 +219,7 @@ class DataVisualizer:
         train_r2 = r2_score(y_train, train_pred)
         val_r2 = r2_score(y_val, val_pred)
         
-        print(f"\\n🎯 MÉTRICAS DETALHADAS:")
+        print(f"\n🎯 MÉTRICAS DETALHADAS:")
         print(f"• MAE Treino: {train_mae:.4f} | Validação: {val_mae:.4f}")
         print(f"• RMSE Treino: {train_rmse:.4f} | Validação: {val_rmse:.4f}")
         print(f"• R² Treino: {train_r2:.4f} | Validação: {val_r2:.4f}")
@@ -214,14 +228,14 @@ class DataVisualizer:
     
     def print_feature_importance(self, feature_importance):
         """Imprime top features mais importantes"""
-        print(f"\\n🔥 TOP 10 FEATURES MAIS IMPORTANTES:")
+        print(f"\n🔥 TOP 10 FEATURES MAIS IMPORTANTES:")
         for i, (feat, imp) in enumerate(feature_importance.head(10).values):
             print(f"{i+1:2d}. {feat:<15} → {imp:>8.0f}")
     
     def print_predictions_stats(self, predictions_df):
         """Imprime estatísticas das predições"""
         pred_stats = predictions_df.groupby('semana')['quantidade'].agg(['sum', 'mean', 'std'])
-        print(f"\\n📊 ESTATÍSTICAS DAS PREDIÇÕES POR SEMANA:")
+        print(f"\n📊 ESTATÍSTICAS DAS PREDIÇÕES POR SEMANA:")
         for week in [1, 2, 3, 4, 5]:
             if week in pred_stats.index:
                 stats = pred_stats.loc[week]
@@ -247,8 +261,18 @@ def create_visualizations(data_dict, model=None, predictions_df=None, output_dir
         )
         
         # Predições para métricas
-        train_pred = model.predict(X_train, num_iteration=model.best_iteration)
-        val_pred = model.predict(X_val, num_iteration=model.best_iteration)
+        if hasattr(model, 'model'):
+            # É nossa classe LightGBMModel
+            train_pred = model.predict(X_train)
+            val_pred = model.predict(X_val)
+        else:
+            # É o modelo do LightGBM diretamente
+            try:
+                train_pred = model.predict(X_train, num_iteration=model.best_iteration)
+                val_pred = model.predict(X_val, num_iteration=model.best_iteration)
+            except TypeError:
+                train_pred = model.predict(X_train, iteration=model.best_iteration)
+                val_pred = model.predict(X_val, iteration=model.best_iteration)
         
         visualizer.print_model_metrics(train_pred, val_pred, y_train, y_val)
         visualizer.print_feature_importance(feature_importance)

@@ -5,7 +5,7 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error
 import pickle
 import os
-from config import MODEL_PARAMS, TRAINING_PARAMS, PREDICTION_WEEKS
+from .config import MODEL_PARAMS, TRAINING_PARAMS, PREDICTION_WEEKS
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
@@ -64,7 +64,15 @@ class LightGBMModel:
         if self.model is None:
             raise ValueError("Modelo não foi treinado. Execute train() primeiro.")
         
-        return self.model.predict(X, num_iteration=self.best_iteration)
+        # Usar best_iteration se disponível, senão usar todas as iterações
+        if self.best_iteration is not None:
+            try:
+                return self.model.predict(X, num_iteration=self.best_iteration)
+            except TypeError:
+                # Para versões mais recentes do LightGBM
+                return self.model.predict(X, iteration=self.best_iteration)
+        else:
+            return self.model.predict(X)
     
     def get_feature_importance(self, importance_type='gain', max_features=None):
         """Retorna feature importance"""
@@ -242,7 +250,7 @@ def train_model(data_dict, save_model_path=None):
 
 def generate_predictions(model, data_dict, weeks=None, parallel=True, save_path=None):
     """Função principal para gerar predições"""
-    predictor = Predictor(model.model, data_dict['feature_columns'])
+    predictor = Predictor(model, data_dict['feature_columns'])
     
     predictions_df = predictor.predict_all_combinations(
         data_dict['aggregated_data'], 
