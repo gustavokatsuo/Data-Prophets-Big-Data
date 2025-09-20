@@ -6,4 +6,9 @@ seaborn
 fastparquet
 lightgbm
 scikit-learn
+<<<<<<< HEAD
 tqdm
+=======
+scipy
+notebook
+>>>>>>> 3b4ce900981ae6dc1b62e34faf3269b34e62ca3e
