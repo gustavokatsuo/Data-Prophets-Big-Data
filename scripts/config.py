@@ -18,7 +18,7 @@ MODEL_PARAMS = {
     'learning_rate': 0.05,
     'num_leaves': 64,
     'min_data_in_leaf': 20,
-    'verbose': -1,
+    'verbose': -1, 
     'seed': 42,
     'num_threads': cpu_count()
 }

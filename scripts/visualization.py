@@ -95,6 +95,161 @@ class DataVisualizer:
         
         return fig
     
+    def plot_outlier_treatment_comparison(self, df_before, df_after, outlier_stats=None, save_plots=True):
+        """Compara dados antes e depois do tratamento de outliers"""
+        print("📊 Gerando comparação antes/depois do tratamento de outliers...")
+        
+        # Criar figura com subplots
+        fig, axes = plt.subplots(3, 2, figsize=(16, 18))
+        fig.suptitle('🔧 Comparação: Antes vs Depois do Tratamento de Outliers', fontsize=16, fontweight='bold')
+        
+        # 1. Vendas Totais por Semana - Comparação
+        weekly_before = df_before.groupby('week_of_year')['qty'].sum()
+        weekly_after = df_after.groupby('week_of_year')['qty'].sum()
+        
+        axes[0, 0].plot(weekly_before.index, weekly_before.values, label='Antes', linewidth=2, color='red', alpha=0.7)
+        axes[0, 0].plot(weekly_after.index, weekly_after.values, label='Depois', linewidth=2, color='blue')
+        axes[0, 0].set_title('📈 Vendas Totais por Semana')
+        axes[0, 0].set_xlabel('Semana do Ano')
+        axes[0, 0].set_ylabel('Quantidade Vendida')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. Distribuição de Vendas - Comparação (log scale)
+        non_zero_before = df_before[df_before['qty'] > 0]['qty']
+        non_zero_after = df_after[df_after['qty'] > 0]['qty']
+        
+        axes[0, 1].hist(np.log1p(non_zero_before), bins=50, alpha=0.5, label='Antes', color='red', density=True)
+        axes[0, 1].hist(np.log1p(non_zero_after), bins=50, alpha=0.7, label='Depois', color='blue', density=True)
+        axes[0, 1].set_title('📊 Distribuição de Vendas (log+1)')
+        axes[0, 1].set_xlabel('log(Quantidade + 1)')
+        axes[0, 1].set_ylabel('Densidade')
+        axes[0, 1].legend()
+        
+        # 3. Estatísticas Descritivas - Comparação
+        stats_before = non_zero_before.describe()
+        stats_after = non_zero_after.describe()
+        
+        metrics = ['mean', 'std', '50%', '75%', '95%', 'max']
+        before_values = [stats_before['mean'], stats_before['std'], stats_before['50%'], 
+                        stats_before['75%'], np.percentile(non_zero_before, 95), stats_before['max']]
+        after_values = [stats_after['mean'], stats_after['std'], stats_after['50%'],
+                       stats_after['75%'], np.percentile(non_zero_after, 95), stats_after['max']]
+        
+        x = np.arange(len(metrics))
+        width = 0.35
+        
+        axes[1, 0].bar(x - width/2, before_values, width, label='Antes', color='red', alpha=0.7)
+        axes[1, 0].bar(x + width/2, after_values, width, label='Depois', color='blue', alpha=0.7)
+        axes[1, 0].set_title('📈 Estatísticas Descritivas')
+        axes[1, 0].set_ylabel('Valor')
+        axes[1, 0].set_xticks(x)
+        axes[1, 0].set_xticklabels(metrics, rotation=45)
+        axes[1, 0].legend()
+        axes[1, 0].set_yscale('log')
+        
+        # 4. Redução de Outliers Extremos
+        # Definir outliers como valores > Q3 + 3*IQR
+        def count_extreme_outliers(data):
+            Q1 = np.percentile(data, 25)
+            Q3 = np.percentile(data, 75)
+            IQR = Q3 - Q1
+            threshold = Q3 + 3 * IQR
+            return np.sum(data > threshold), threshold
+        
+        outliers_before, thresh_before = count_extreme_outliers(non_zero_before)
+        outliers_after, thresh_after = count_extreme_outliers(non_zero_after)
+        
+        outlier_data = [outliers_before, outliers_after]
+        outlier_labels = ['Antes', 'Depois']
+        colors = ['red', 'blue']
+        
+        bars = axes[1, 1].bar(outlier_labels, outlier_data, color=colors, alpha=0.7)
+        axes[1, 1].set_title('🎯 Outliers Extremos Detectados')
+        axes[1, 1].set_ylabel('Número de Outliers')
+        
+        # Adicionar valores nos barras
+        for bar, value in zip(bars, outlier_data):
+            height = bar.get_height()
+            axes[1, 1].text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                           f'{int(value):,}', ha='center', va='bottom', fontweight='bold')
+        
+        # 5. Boxplot Comparativo (limitado para visualização)
+        # Usar amostra para boxplot se dados forem muito grandes
+        sample_size = min(10000, len(non_zero_before), len(non_zero_after))
+        sample_before = non_zero_before.sample(sample_size) if len(non_zero_before) > sample_size else non_zero_before
+        sample_after = non_zero_after.sample(sample_size) if len(non_zero_after) > sample_size else non_zero_after
+        
+        data_boxplot = [sample_before, sample_after]
+        axes[2, 0].boxplot(data_boxplot, labels=['Antes', 'Depois'], patch_artist=True,
+                          boxprops=dict(facecolor='lightblue', alpha=0.7))
+        axes[2, 0].set_title('📦 Boxplot Comparativo')
+        axes[2, 0].set_ylabel('Quantidade Vendida')
+        axes[2, 0].set_yscale('log')
+        
+        # 6. Estatísticas do Tratamento de Outliers
+        if outlier_stats is not None and not outlier_stats.empty:
+            # Gráfico de pizza com tipos de grupos
+            cv_counts = []
+            cv_labels = []
+            
+            low_cv = (outlier_stats['cv'] < 1.0).sum()
+            med_cv = ((outlier_stats['cv'] >= 1.0) & (outlier_stats['cv'] < 2.0)).sum()
+            high_cv = (outlier_stats['cv'] >= 2.0).sum()
+            
+            if low_cv > 0:
+                cv_counts.append(low_cv)
+                cv_labels.append('Baixa Variabilidade')
+            if med_cv > 0:
+                cv_counts.append(med_cv)
+                cv_labels.append('Média Variabilidade')
+            if high_cv > 0:
+                cv_counts.append(high_cv)
+                cv_labels.append('Alta Variabilidade')
+            
+            if cv_counts:
+                axes[2, 1].pie(cv_counts, labels=cv_labels, autopct='%1.1f%%', 
+                              colors=['lightgreen', 'gold', 'lightcoral'])
+                axes[2, 1].set_title('🎚️ Grupos por Variabilidade (CV)')
+            else:
+                axes[2, 1].text(0.5, 0.5, 'Sem dados\nde outliers', ha='center', va='center', 
+                               transform=axes[2, 1].transAxes, fontsize=12)
+                axes[2, 1].set_title('🎚️ Estatísticas de Outliers')
+        else:
+            axes[2, 1].text(0.5, 0.5, 'Sem estatísticas\nde outliers', ha='center', va='center', 
+                           transform=axes[2, 1].transAxes, fontsize=12)
+            axes[2, 1].set_title('🎚️ Estatísticas de Outliers')
+        
+        # Informações textuais
+        reduction_pct = ((outliers_before - outliers_after) / outliers_before * 100) if outliers_before > 0 else 0
+        max_reduction = ((stats_before['max'] - stats_after['max']) / stats_before['max'] * 100) if stats_before['max'] > 0 else 0
+        
+        # Calcular threshold médio de forma segura
+        if outlier_stats is not None and not outlier_stats.empty and 'threshold_used' in outlier_stats.columns:
+            threshold_avg = f"{outlier_stats['threshold_used'].mean():.2f}"
+        else:
+            threshold_avg = "N/A"
+        
+        text_info = f"""
+        📊 RESUMO DO TRATAMENTO:
+        • Outliers extremos reduzidos: {reduction_pct:.1f}%
+        • Valor máximo reduzido: {max_reduction:.1f}%
+        • Registros processados: {len(df_after):,}
+        • Threshold médio usado: {threshold_avg}
+        """
+        
+        fig.text(0.02, 0.02, text_info, fontsize=10, verticalalignment='bottom',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.15)
+        
+        if save_plots:
+            plt.savefig(f'{self.output_dir}/outlier_treatment_comparison.png', dpi=PLOT_CONFIG['dpi'], bbox_inches='tight')
+        plt.show()
+        
+        return fig
+    
     def plot_training_results(self, model, X_train, y_train, X_val, y_val, features, save_plots=True):
         """Plota resultados do treinamento e feature importance"""
         print("🎯 Analisando resultados do treinamento...")

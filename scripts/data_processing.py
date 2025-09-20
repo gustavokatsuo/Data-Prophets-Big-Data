@@ -56,34 +56,23 @@ def _process_outlier_group(group, rolling_window, z_threshold, treatment, adapti
             # Método simples para grupos pequenos
             outliers_mask = np.abs(qty_values - mean_qty) > (threshold * std_qty)
         else:
-            # Método rolling otimizado usando numpy
-            group_sorted = group.sort_values('week_of_year')
-            qty_sorted = group_sorted['qty'].values
+            # Método rolling otimizado usando pandas (mais confiável)
+            group_sorted = group.sort_values('week_of_year').copy()
             
-            # Calcular rolling statistics de forma vetorizada
-            rolling_mean = np.full(n_obs, mean_qty)
-            rolling_std = np.full(n_obs, std_qty)
-            
-            for i in range(1, min(n_obs, rolling_window + 1)):
-                if i >= 3:  # min_periods
-                    rolling_mean[i] = np.mean(qty_sorted[:i])
-                    rolling_std[i] = np.std(qty_sorted[:i]) or std_qty
-            
-            for i in range(rolling_window + 1, n_obs):
-                rolling_mean[i] = np.mean(qty_sorted[i-rolling_window:i])
-                rolling_std[i] = np.std(qty_sorted[i-rolling_window:i]) or std_qty
-            
-            # Evitar divisão por zero
-            rolling_std = np.where(rolling_std == 0, std_qty, rolling_std)
+            # Usar pandas rolling que é mais robusto
+            rolling_mean = group_sorted['qty'].shift(1).rolling(rolling_window, min_periods=3).mean().fillna(mean_qty)
+            rolling_std = group_sorted['qty'].shift(1).rolling(rolling_window, min_periods=3).std().fillna(std_qty)
+            rolling_std = rolling_std.replace(0, std_qty)
             
             # Calcular Z-scores
-            z_scores = np.abs((qty_sorted - rolling_mean) / rolling_std)
-            outliers_mask = z_scores > threshold
+            z_scores = np.abs((group_sorted['qty'] - rolling_mean) / rolling_std)
+            outliers_mask_sorted = z_scores > threshold
             
-            # Reordenar mask para corresponder ao grupo original
-            if not group_sorted.index.equals(group.index):
-                sort_indices = group_sorted.index.get_indexer(group.index)
-                outliers_mask = outliers_mask[sort_indices]
+            # Mapear de volta para a ordem original do grupo
+            outliers_mask = np.zeros(len(group), dtype=bool)
+            for i, idx in enumerate(group_sorted.index):
+                original_pos = group.index.get_loc(idx)
+                outliers_mask[original_pos] = outliers_mask_sorted.iloc[i]
 
         n_outliers = np.sum(outliers_mask)
         
@@ -107,13 +96,20 @@ def _process_outlier_group(group, rolling_window, z_threshold, treatment, adapti
                 group_copy.loc[outliers_mask, 'qty'] = np.clip(group_copy.loc[outliers_mask, 'qty'], p05, p95)
             
             elif treatment == 'cap':
+                # Calcular limites de forma mais conservadora
                 if n_obs >= min_observations:
-                    upper_limit = rolling_mean[outliers_mask] + 3 * rolling_std[outliers_mask]
-                    lower_limit = np.maximum(rolling_mean[outliers_mask] - 3 * rolling_std[outliers_mask], 0)
+                    # Usar percentil 95 como limite superior mais seguro
+                    upper_limit = min(np.percentile(qty_values, 95), mean_qty + 2 * std_qty)
+                    lower_limit = max(0, np.percentile(qty_values, 5))
                 else:
-                    upper_limit = mean_qty + 3 * std_qty
-                    lower_limit = max(0, mean_qty - 3 * std_qty)
-                group_copy.loc[outliers_mask, 'qty'] = np.clip(group_copy.loc[outliers_mask, 'qty'], lower_limit, upper_limit)
+                    upper_limit = mean_qty + 2 * std_qty
+                    lower_limit = max(0, mean_qty - 2 * std_qty)
+                
+                # Aplicar cap apenas para reduzir outliers, nunca aumentar
+                outlier_values = group_copy.loc[outliers_mask, 'qty']
+                capped_values = np.where(outlier_values > upper_limit, upper_limit, 
+                                       np.where(outlier_values < lower_limit, lower_limit, outlier_values))
+                group_copy.loc[outliers_mask, 'qty'] = capped_values
 
             elif treatment == 'remove':
                 group_copy = group_copy[~outliers_mask]
@@ -124,7 +120,6 @@ def _process_outlier_group(group, rolling_window, z_threshold, treatment, adapti
 
     except Exception as e:
         # Retornar o grupo original e estatísticas vazias em caso de erro
-        return group, {}
         return group, {}
 
 class DataProcessor:
@@ -531,11 +526,26 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
     processor.load_data(file_path)
     processor.aggregate_data()
     
+    # Salvar dados antes do tratamento de outliers para comparação
+    df_before_outliers = processor.df_agg.copy() if treat_outliers else None
+    
     # Tratamento de outliers personalizado
     if treat_outliers:
         processor.detect_and_treat_outliers(**outlier_params)
         # Análise dos resultados
         outlier_analysis = processor.analyze_outlier_treatment()
+        
+        # Gerar gráficos de comparação antes/depois do tratamento
+        from .visualization import DataVisualizer
+        visualizer = DataVisualizer()
+        print("\n🎨 Gerando visualizações de comparação do tratamento de outliers...")
+        outlier_stats = getattr(processor, 'outlier_stats', None)
+        visualizer.plot_outlier_treatment_comparison(
+            df_before_outliers, 
+            processor.df_agg, 
+            outlier_stats=outlier_stats,
+            save_plots=True
+        )
     else:
         outlier_analysis = None
     

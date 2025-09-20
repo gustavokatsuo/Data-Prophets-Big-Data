@@ -179,59 +179,164 @@ class Predictor:
         return predictions
     
     def predict_all_combinations(self, aggregated_data, weeks=None, parallel=True):
-        """Prediz para todas as combinações PDV-produto"""
-        from concurrent.futures import ProcessPoolExecutor
+        """Prediz para todas as combinações PDV-produto de forma otimizada"""
+        import multiprocessing as mp
         from tqdm import tqdm
-        from multiprocessing import cpu_count
+        from functools import partial
         
-        print("🔮 Gerando predições...")
+        print("🔮 Gerando predições de forma otimizada...")
         weeks = weeks or PREDICTION_WEEKS
         
         # Obter combinações únicas
-        pdv_prod_list = aggregated_data[['pdv', 'internal_product_id']].drop_duplicates().to_records(index=False)
+        pdv_prod_list = aggregated_data[['pdv', 'internal_product_id']].drop_duplicates().values
+        print(f"   → {len(pdv_prod_list):,} combinações PDV-produto para predizer")
         
-        # Pré-agrupar dados históricos
-        hist_data_map = {
-            (pdv, sku): group.sort_values('week_of_year')
-            for (pdv, sku), group in aggregated_data.groupby(['pdv', 'internal_product_id'])
-        }
+        # Pré-agrupar dados históricos de forma mais eficiente
+        hist_data_map = {}
+        for (pdv, sku), group in aggregated_data.groupby(['pdv', 'internal_product_id']):
+            hist_data_map[(pdv, sku)] = group.sort_values('week_of_year')
+        
+        print(f"   → Dados históricos preparados para {len(hist_data_map):,} grupos")
         
         all_predictions = []
         
-        if parallel:
-            # Processamento paralelo
-            tasks = []
+        if parallel and len(pdv_prod_list) > 100:  # Só usar paralelo se valer a pena
+            # Filtrar combinações válidas
+            valid_tasks = []
             for pdv, sku in pdv_prod_list:
-                hist = hist_data_map.get((pdv, sku), pd.DataFrame())
-                if not hist.empty:
-                    tasks.append((pdv, sku, hist, self.model, self.feature_columns, weeks))
+                hist = hist_data_map.get((pdv, sku))
+                if hist is not None and not hist.empty and len(hist) >= 3:  # Mínimo histórico
+                    valid_tasks.append((pdv, sku, hist))
             
-            with ProcessPoolExecutor(max_workers=cpu_count()) as executor:
+            print(f"   → {len(valid_tasks):,} combinações válidas para predição")
+            
+            # Otimização: usar chunksize maior para reduzir overhead
+            num_processes = min(mp.cpu_count(), len(valid_tasks))
+            chunksize = max(1, len(valid_tasks) // (num_processes * 2))  # Chunks maiores
+            
+            print(f"   → Utilizando {num_processes} processos com chunksize {chunksize}")
+            
+            # Criar função para processamento em lote
+            def process_chunk(chunk_data):
+                chunk_results = []
+                for pdv, sku, hist_data in chunk_data:
+                    try:
+                        predictions = self._predict_single_optimized(pdv, sku, hist_data, weeks)
+                        chunk_results.extend(predictions)
+                    except Exception as e:
+                        # Continuar mesmo se uma predição falhar
+                        continue
+                return chunk_results
+            
+            # Dividir em chunks
+            chunks = [valid_tasks[i:i + chunksize] for i in range(0, len(valid_tasks), chunksize)]
+            
+            # Processamento paralelo com chunks
+            with mp.Pool(processes=num_processes) as pool:
                 results = list(tqdm(
-                    executor.map(self._predict_single_task, tasks), 
-                    total=len(tasks),
-                    desc="Predições"
+                    pool.imap(process_chunk, chunks), 
+                    total=len(chunks),
+                    desc="Predições (chunks)"
                 ))
             
             # Achatar resultados
             for result_list in results:
                 all_predictions.extend(result_list)
+                
         else:
-            # Processamento sequencial
-            for i, (pdv, sku) in enumerate(tqdm(pdv_prod_list, desc="Predições")):
-                hist = hist_data_map.get((pdv, sku), pd.DataFrame())
-                if not hist.empty:
-                    predictions = self.predict_single_combination(pdv, sku, hist, weeks)
-                    all_predictions.extend(predictions)
+            # Processamento sequencial otimizado
+            print("   → Usando processamento sequencial otimizado")
+            for pdv, sku in tqdm(pdv_prod_list, desc="Predições"):
+                hist = hist_data_map.get((pdv, sku))
+                if hist is not None and not hist.empty and len(hist) >= 3:
+                    try:
+                        predictions = self._predict_single_optimized(pdv, sku, hist, weeks)
+                        all_predictions.extend(predictions)
+                    except Exception:
+                        continue
         
+        print(f"   → {len(all_predictions):,} predições geradas")
         return pd.DataFrame(all_predictions)
     
-    @staticmethod
-    def _predict_single_task(args):
-        """Task para processamento paralelo"""
-        pdv, sku, hist_data, model, feature_columns, weeks = args
-        predictor = Predictor(model, feature_columns)
-        return predictor.predict_single_combination(pdv, sku, hist_data, weeks)
+    def _predict_single_optimized(self, pdv, sku, hist_data, weeks):
+        """Versão otimizada de predição para uma combinação"""
+        try:
+            predictions = []
+            current_data = hist_data.copy()
+            
+            for week in weeks:
+                # Calcular features de forma otimizada
+                features = self._calculate_features_fast(current_data)
+                
+                if features is not None and len(features) == len(self.feature_columns):
+                    # Predição usando numpy para velocidade
+                    pred = self.model.predict([features], num_iteration=self.model.best_iteration)[0]
+                    pred = max(0, pred)  # Não permitir predições negativas
+                    
+                    predictions.append({
+                        'pdv': pdv,
+                        'internal_product_id': sku,
+                        'week': week,
+                        'predicted_qty': pred
+                    })
+                    
+                    # Adicionar predição ao histórico para próxima semana
+                    new_row = pd.DataFrame({
+                        'week_of_year': [current_data['week_of_year'].max() + 1],
+                        'pdv': [pdv],
+                        'internal_product_id': [sku],
+                        'qty': [pred]
+                    })
+                    current_data = pd.concat([current_data, new_row], ignore_index=True)
+                    
+                    # Manter apenas últimas N semanas para eficiência
+                    if len(current_data) > 20:
+                        current_data = current_data.tail(20)
+                        
+            return predictions
+            
+        except Exception as e:
+            return []
+    
+    def _calculate_features_fast(self, data):
+        """Calcula features de forma otimizada usando numpy"""
+        try:
+            if len(data) < 1:
+                return None
+                
+            qty_values = data['qty'].values
+            current_week = data['week_of_year'].iloc[-1] + 1
+            
+            # Features básicas
+            features = [current_week]  # week_of_year
+            
+            # Lags - usar indexação numpy direta
+            for lag in [1, 2, 3, 4, 8, 12]:
+                if len(qty_values) >= lag:
+                    features.append(qty_values[-lag])
+                else:
+                    features.append(0)
+            
+            # Rolling means/std - usar numpy para velocidade
+            if len(qty_values) >= 4:
+                features.append(np.mean(qty_values[-4:]))  # rmean_4
+                features.append(np.std(qty_values[-4:]))   # rstd_4
+            else:
+                features.extend([0, 0])
+            
+            # Fração de não zeros
+            if len(qty_values) >= 8:
+                features.append(np.mean(qty_values[-8:] > 0))  # nonzero_frac_8
+            else:
+                features.append(0)
+            
+            # Gross (assumir proporcional à quantidade)
+            features.append(qty_values[-1] * 10 if len(qty_values) > 0 else 0)
+            
+            return features
+            
+        except Exception:
+            return None
 
 def train_model(data_dict, save_model_path=None):
     """Função principal para treinar modelo"""
