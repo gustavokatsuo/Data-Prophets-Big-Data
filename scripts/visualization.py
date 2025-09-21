@@ -57,7 +57,11 @@ class DataVisualizer:
         axes[0, 2].set_xlabel('log(Quantidade + 1)')
         axes[0, 2].set_ylabel('Frequência')
         
+<<<<<<< HEAD
         # 4. Correlação entre features (removido 'gross' para evitar data leakage)
+=======
+        # 4. Correlação entre features
+>>>>>>> c58a2787c361521d7728d29ce032232d5ac29c05
         feature_cols = ['qty'] + [c for c in df_agg.columns if c.startswith('lag_')][:4]
         corr_matrix = df_agg[feature_cols].corr()
         sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, ax=axes[1, 0])
@@ -91,7 +95,11 @@ class DataVisualizer:
         
         if save_plots:
             plt.savefig(f'{self.output_dir}/data_insights.png', dpi=PLOT_CONFIG['dpi'], bbox_inches='tight')
+<<<<<<< HEAD
         # plt.show()
+=======
+        #plt.show()
+>>>>>>> c58a2787c361521d7728d29ce032232d5ac29c05
         
         return fig
     
@@ -266,7 +274,11 @@ class DataVisualizer:
         
         if save_plots:
             plt.savefig(f'{self.output_dir}/outlier_treatment_comparison.png', dpi=PLOT_CONFIG['dpi'], bbox_inches='tight')
+<<<<<<< HEAD
         # plt.show()
+=======
+        #plt.show()
+>>>>>>> c58a2787c361521d7728d29ce032232d5ac29c05
         
         return fig
     
@@ -343,7 +355,11 @@ class DataVisualizer:
         
         if save_plots:
             plt.savefig(f'{self.output_dir}/training_results.png', dpi=PLOT_CONFIG['dpi'], bbox_inches='tight')
+<<<<<<< HEAD
         # plt.show()
+=======
+        #plt.show()
+>>>>>>> c58a2787c361521d7728d29ce032232d5ac29c05
         
         return feature_imp, fig
     
@@ -367,7 +383,11 @@ class DataVisualizer:
         
         if save_plots:
             plt.savefig(f'{self.output_dir}/predictions_summary.png', dpi=PLOT_CONFIG['dpi'], bbox_inches='tight')
+<<<<<<< HEAD
         # plt.show()
+=======
+        #plt.show()
+>>>>>>> c58a2787c361521d7728d29ce032232d5ac29c05
         
         return plt.gcf()
     

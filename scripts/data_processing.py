@@ -2,7 +2,10 @@
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from .config import LAG_FEATURES, OUTLIER_PARAMS, DUMMY_FEATURES, EMBEDDING_FEATURES, EMBEDDING_CONFIG
+try:
+    from .config import LAG_FEATURES, OUTLIER_PARAMS, DUMMY_FEATURES, EMBEDDING_FEATURES, EMBEDDING_CONFIG
+except ImportError:
+    from config import LAG_FEATURES, OUTLIER_PARAMS, DUMMY_FEATURES, EMBEDDING_FEATURES, EMBEDDING_CONFIG
 import warnings
 import multiprocessing as mp
 from functools import partial
@@ -11,6 +14,101 @@ from sklearn.preprocessing import LabelEncoder
 warnings.filterwarnings('ignore')
 
 def _process_outlier_group_wrapper(args):
+    """Wrapper function para desempacotar argumentos do multiprocessing."""
+    name_group_tuple, outlier_params = args
+    name, group = name_group_tuple
+    group.name = name
+    return _process_outlier_group(group, **outlier_params)
+
+def _interpolate_week37_group(group_data):
+    """
+    Função auxiliar para interpolar semana 37 em um único grupo (para paralelização)
+    
+    Args:
+        group_data: tuple contendo (key, group_dataframe)
+    
+    Returns:
+        tuple: (success_flag, interpolated_group, metadata)
+    """
+    (pdv, product), group = group_data
+    
+    try:
+        group = group.sort_values('week_of_year').reset_index(drop=True)
+        
+        # Verificar se esta combinação tem dados da semana 37
+        if 37 in group['week_of_year'].values:
+            # Remover semana 37
+            group_filtered = group[group['week_of_year'] != 37].copy()
+            
+            # Se temos dados suficientes para interpolar (pelo menos 2 pontos)
+            if len(group_filtered) >= 2:
+                # Verificar se há semanas vizinhas para interpolação efetiva
+                weeks_available = sorted(group_filtered['week_of_year'].unique())
+                
+                # Encontrar semanas vizinhas da 37
+                weeks_before_37 = [w for w in weeks_available if w < 37]
+                weeks_after_37 = [w for w in weeks_available if w > 37]
+                
+                if weeks_before_37 and weeks_after_37:
+                    # Interpolar apenas qty, manter outras colunas da semana mais próxima
+                    week_before = max(weeks_before_37)
+                    week_after = min(weeks_after_37)
+                    
+                    qty_before = group_filtered[group_filtered['week_of_year'] == week_before]['qty'].iloc[0]
+                    qty_after = group_filtered[group_filtered['week_of_year'] == week_after]['qty'].iloc[0]
+                    
+                    # Interpolação linear
+                    interpolated_qty = (qty_before + qty_after) / 2
+                    
+                    # Criar registro interpolado usando dados da semana mais próxima como base
+                    closest_week = week_before if abs(37 - week_before) <= abs(37 - week_after) else week_after
+                    base_row = group_filtered[group_filtered['week_of_year'] == closest_week].copy()
+                    
+                    # Atualizar valores interpolados
+                    base_row['week_of_year'] = 37
+                    base_row['qty'] = interpolated_qty
+                    base_row['gross'] = base_row['gross'].iloc[0] * (interpolated_qty / base_row['qty'].iloc[0]) if base_row['qty'].iloc[0] > 0 else 0
+                    
+                    # Adicionar registro interpolado de volta
+                    group_interpolated = pd.concat([group_filtered, base_row], ignore_index=True)
+                    group_interpolated = group_interpolated.sort_values('week_of_year')
+                    
+                    return (True, group_interpolated, {'interpolated': True, 'pdv': pdv, 'product': product})
+                else:
+                    # Não há semanas vizinhas suficientes, manter sem semana 37
+                    return (True, group_filtered, {'interpolated': False, 'pdv': pdv, 'product': product})
+            else:
+                # Dados insuficientes para interpolação, manter sem semana 37
+                return (True, group_filtered, {'interpolated': False, 'pdv': pdv, 'product': product})
+        else:
+            # Esta combinação não tem semana 37, manter como está
+            return (True, group, {'interpolated': False, 'pdv': pdv, 'product': product})
+            
+    except Exception as e:
+        # Em caso de erro, retornar grupo original
+        print(f"⚠️ Erro ao processar PDV {pdv}, Produto {product}: {e}")
+        return (False, group, {'interpolated': False, 'pdv': pdv, 'product': product, 'error': str(e)})
+
+def _interpolate_week37_chunk(chunk_data):
+    """
+    Processa um chunk de grupos para interpolação da semana 37
+    
+    Args:
+        chunk_data: lista de (key, group) tuples
+    
+    Returns:
+        tuple: (interpolated_groups, metadata_list)
+    """
+    interpolated_groups = []
+    metadata_list = []
+    
+    for group_data in chunk_data:
+        success, result_group, metadata = _interpolate_week37_group(group_data)
+        if success:
+            interpolated_groups.append(result_group)
+            metadata_list.append(metadata)
+    
+    return interpolated_groups, metadata_list
     """Wrapper function para desempacotar argumentos do multiprocessing."""
     name_group_tuple, outlier_params = args
     name, group = name_group_tuple
@@ -216,6 +314,7 @@ class DataProcessor:
         
         return self.df_agg
     
+<<<<<<< HEAD
     def _interpolate_missing_week(self, missing_week):
         """Interpola dados para uma semana ausente usando média das semanas vizinhas"""
         print(f"   → Interpolando dados para semana {missing_week}...")
@@ -268,6 +367,112 @@ class DataProcessor:
         self.df_agg = pd.concat([self.df_agg, interpolated_final], ignore_index=True)
         
         print(f"   → Semana {missing_week} interpolada: {len(interpolated_final):,} registros adicionados")
+=======
+    def remove_and_interpolate_week_37(self, parallel=True, n_jobs=None):
+        """
+        Remove dados da semana 37 e interpola os valores usando interpolação linear com processamento paralelo
+        
+        Args:
+            parallel (bool): Se deve usar processamento paralelo
+            n_jobs (int): Número de processos a usar (None = auto)
+        """
+        print("� Removendo e interpolando dados da semana 37 com processamento paralelo...")
+        
+        # Verificar se existe semana 37 nos dados
+        if 37 not in self.df_agg['week_of_year'].values:
+            print("   → Semana 37 não encontrada nos dados. Nenhuma ação necessária.")
+            return self.df_agg
+        
+        # Estatísticas antes da remoção
+        week_37_count = (self.df_agg['week_of_year'] == 37).sum()
+        week_37_qty = self.df_agg[self.df_agg['week_of_year'] == 37]['qty'].sum()
+        total_qty_before = self.df_agg['qty'].sum()
+        
+        print(f"   → Encontrados {week_37_count:,} registros na semana 37")
+        print(f"   → Quantidade total semana 37: {week_37_qty:,.0f}")
+        print(f"   → Percentual do volume total: {(week_37_qty/total_qty_before)*100:.2f}%")
+        
+        # Ordenar dados para interpolação
+        self.df_agg = self.df_agg.sort_values(['pdv', 'internal_product_id', 'week_of_year'])
+        
+        # Preparar dados para processamento
+        groups = list(self.df_agg.groupby(['pdv', 'internal_product_id']))
+        total_combinations = len(groups)
+        
+        print(f"   → Processando {total_combinations:,} combinações PDV-produto...")
+        
+        if parallel and total_combinations > 1000:  # Aumentar limite para datasets maiores
+            # Processamento paralelo
+            n_processes = n_jobs or min(mp.cpu_count(), max(1, total_combinations // 500))
+            chunk_size = max(1, total_combinations // (n_processes * 4))
+            
+            print(f"   → Usando {n_processes} processos com chunks de {chunk_size} combinações")
+            
+            # Dividir em chunks
+            chunks = [groups[i:i + chunk_size] for i in range(0, len(groups), chunk_size)]
+            
+            interpolated_data = []
+            combinations_interpolated = 0
+            
+            try:
+                with mp.Pool(processes=n_processes) as pool:
+                    results = list(tqdm(
+                        pool.imap(_interpolate_week37_chunk, chunks),
+                        total=len(chunks),
+                        desc="Interpolando semana 37"
+                    ))
+                
+                # Consolidar resultados
+                for chunk_groups, chunk_metadata in results:
+                    interpolated_data.extend(chunk_groups)
+                    combinations_interpolated += sum(1 for meta in chunk_metadata if meta.get('interpolated', False))
+                
+            except Exception as e:
+                print(f"⚠️ Erro no processamento paralelo: {e}")
+                print("   → Executando processamento sequencial...")
+                parallel = False
+        
+        if not parallel or total_combinations <= 100:
+            # Processamento sequencial (fallback ou para poucos dados)
+            print("   → Usando processamento sequencial...")
+            
+            interpolated_data = []
+            combinations_interpolated = 0
+            
+            for i, ((pdv, product), group) in enumerate(groups):
+                success, result_group, metadata = _interpolate_week37_group(((pdv, product), group))
+                
+                if success:
+                    interpolated_data.append(result_group)
+                    if metadata.get('interpolated', False):
+                        combinations_interpolated += 1
+                
+                if (i + 1) % 1000 == 0:
+                    print(f"   → Processadas {i + 1:,} / {total_combinations:,} combinações...")
+        
+        # Reconstruir DataFrame
+        if interpolated_data:
+            self.df_agg = pd.concat(interpolated_data, ignore_index=True)
+            self.df_agg = self.df_agg.sort_values(['pdv', 'internal_product_id', 'week_of_year'])
+        
+        # Estatísticas após interpolação
+        week_37_count_after = (self.df_agg['week_of_year'] == 37).sum()
+        week_37_qty_after = self.df_agg[self.df_agg['week_of_year'] == 37]['qty'].sum()
+        total_qty_after = self.df_agg['qty'].sum()
+        
+        print(f"\n📊 RESULTADO DA INTERPOLAÇÃO PARALELA:")
+        print(f"   → Combinações processadas: {total_combinations:,}")
+        print(f"   → Combinações interpoladas: {combinations_interpolated:,}")
+        print(f"   → Taxa de interpolação: {(combinations_interpolated/total_combinations)*100:.1f}%")
+        print(f"   → Registros semana 37 após interpolação: {week_37_count_after:,}")
+        print(f"   → Quantidade semana 37 antes: {week_37_qty:,.0f}")
+        print(f"   → Quantidade semana 37 após interpolação: {week_37_qty_after:,.0f}")
+        print(f"   → Redução na quantidade da semana 37: {((week_37_qty - week_37_qty_after)/week_37_qty)*100:.1f}%")
+        print(f"   → Volume total após interpolação: {total_qty_after:,.0f}")
+        
+        print("✅ Interpolação paralela da semana 37 concluída!")
+        return self.df_agg
+>>>>>>> c58a2787c361521d7728d29ce032232d5ac29c05
     
     def create_lag_features(self):
         """Cria features de lag e rolling de forma vetorizada"""
@@ -307,7 +512,11 @@ class DataProcessor:
         # Criar features categóricas
         self.create_categorical_features()
         
+<<<<<<< HEAD
         # Definir colunas de features básicas (removido 'gross' para evitar data leakage)
+=======
+        # Definir colunas de features básicas
+>>>>>>> c58a2787c361521d7728d29ce032232d5ac29c05
         base_features = ['week_of_year'] + lag_cols
         self.feature_columns = base_features + self.categorical_features
         
@@ -900,7 +1109,7 @@ class DataProcessor:
         
         return X, y
 
-def process_data(file_path, treat_outliers=True, outlier_params=None):
+def process_data(file_path, treat_outliers=True, outlier_params=None, interpolate_week_37=True):
     """
     Função principal para processar dados completos
     
@@ -908,6 +1117,7 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
         file_path (str): Caminho para o arquivo de dados
         treat_outliers (bool): Se deve aplicar tratamento de outliers
         outlier_params (dict): Parâmetros para tratamento de outliers personalizado
+        interpolate_week_37 (bool): Se deve remover e interpolar dados da semana 37
     """
     if outlier_params is None:
         outlier_params = OUTLIER_PARAMS
@@ -917,6 +1127,10 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
     # Pipeline de processamento
     processor.load_data(file_path)
     processor.aggregate_data()
+    
+    # Remover e interpolar dados da semana 37 (dados inflacionados) se solicitado
+    if interpolate_week_37:
+        processor.remove_and_interpolate_week_37(parallel=True)
     
     # Salvar dados antes do tratamento de outliers para comparação
     df_before_outliers = processor.df_agg.copy() if treat_outliers else None
