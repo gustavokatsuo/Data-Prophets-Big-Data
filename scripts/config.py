@@ -1,4 +1,5 @@
 # Configurações globais do projeto
+from cmath import inf
 import os
 from multiprocessing import cpu_count
 
@@ -48,8 +49,8 @@ EMBEDDING_CONFIG = {
 
 # Divisão temporal
 TRAIN_CUTOFF = 44  # Semanas <= 44 para treino
-VALID_START = 45   # Semanas 45-48 para validação
-VALID_END = 48
+VALID_START = 45   # Semanas 45-52 para validação
+VALID_END = 52
 
 # Predições
 PREDICTION_WEEKS = [1, 2, 3, 4, 5]  # Janeiro 2023
@@ -64,12 +65,12 @@ PLOT_CONFIG = {
 
 # Parâmetros de detecção e tratamento de outliers
 OUTLIER_PARAMS = {
-    'method': 'median_imputation',     # IMPUTAÇÃO POR MEDIANA - mais conservador
+    'method': 'z_score',               # Método de detecção
     'percentile_cap': 90.0,            # Detectar outliers acima de P90
-    'absolute_cap': 24,                # Detectar outliers acima de 24 unidades
+    'absolute_cap': inf,               # Detectar outliers acima de 24 unidades (infinito desabilita)
     'rolling_window': 6,               # Mantido para compatibilidade
-    'z_threshold': 2.0,                # Threshold mais agressivo se usar Z-score
-    'treatment': 'median_impute',      # IMPUTAR COM MEDIANA
+    'z_threshold': 4.0,                # Threshold mais agressivo se usar Z-score
+    'treatment': 'winsorize',          # IMPUTAR COM WINSORIZAÇÃO
     'adaptive_threshold': True,        # Ajusta threshold baseado nas características do grupo
     'min_observations': 10             # Mínimo de observações para estatísticas confiáveis
 }
