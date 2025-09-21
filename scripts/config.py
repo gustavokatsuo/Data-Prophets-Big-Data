@@ -64,14 +64,15 @@ PLOT_CONFIG = {
 
 # Parâmetros de detecção e tratamento de outliers
 OUTLIER_PARAMS = {
-    'method': 'median_imputation',     # IMPUTAÇÃO POR MEDIANA - mais conservador
-    'percentile_cap': 90.0,            # Detectar outliers acima de P90
-    'absolute_cap': 24,                # Detectar outliers acima de 24 unidades
-    'rolling_window': 6,               # Mantido para compatibilidade
-    'z_threshold': 2.0,                # Threshold mais agressivo se usar Z-score
-    'treatment': 'median_impute',      # IMPUTAR COM MEDIANA
-    'adaptive_threshold': True,        # Ajusta threshold baseado nas características do grupo
-    'min_observations': 10             # Mínimo de observações para estatísticas confiáveis
+    'method': 'z_score',                   # Método Z-score com winsorização
+    'percentile_cap': 98.0,                # Percentil alto para preservar mais dados
+    'absolute_cap': float('inf'),          # Sem cap absoluto para preservar sazonalidade
+    'rolling_window': 12,                  # Janela de 12 semanas para estabilidade
+    'z_threshold': 4.0,                    # Threshold conservador (4 desvios padrão)
+    'treatment': 'winsorize',              # WINSORIZAÇÃO - preserva distribuição
+    'adaptive_threshold': True,            # Ajuste adaptativo por características do grupo
+    'min_observations': 8,                 # Mínimo de observações para cálculos confiáveis
+    'absolute_cap_multiplier': 5.0         # Cap como múltiplo da média (backup)
 }
 
 # Configurações de processamento

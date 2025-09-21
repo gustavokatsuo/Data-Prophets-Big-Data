@@ -88,7 +88,8 @@ def main():
     print("-" * 40)
     
     try:
-        predictions_path = os.path.join(OUTPUT_DIR, 'submission_jan2023.csv')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        predictions_path = os.path.join(OUTPUT_DIR, f'submission_jan2023_{timestamp}.csv')
         predictions_df = generate_predictions(
             model, 
             data_dict, 

@@ -152,8 +152,27 @@ class DataProcessor:
         
         # Remover coluna semana_do_ano se existir e criar week_of_year baseado em datas
         self.df_raw = self.df_raw.drop(columns=['semana_do_ano'], errors='ignore')
+
+        # Remove PDCs inválidos
+        self.df_raw = self.df_raw[self.df_raw['pdv'].notnull() & (self.df_raw['pdv'] != '') & (self.df_raw['pdv'] != 'desconhecido')]
+        self.df_raw['pdv'] = self.df_raw['pdv'].astype(int)
         min_date = self.df_raw['transaction_date'].min()
         self.df_raw['week_of_year'] = (self.df_raw['transaction_date'] - min_date).dt.days // 7 + 1
+        
+        # GAMBIARRA ESPECÍFICA: Remoção da semana 37 (dados inflacionados ~60x)
+        # Esta semana tem valores anômalos que não representam vendas reais - REMOVER COMPLETAMENTE
+        if 37 in self.df_raw['week_of_year'].values:
+            print("⚠️ GAMBIARRA DETECTADA: Semana 37 encontrada com dados inflacionados!")
+            print("   → Aplicando correção RADICAL: REMOVENDO semana 37 e interpolando valores")
+            
+            week_37_records = (self.df_raw['week_of_year'] == 37).sum()
+            
+            # REMOVER COMPLETAMENTE todos os dados da semana 37
+            self.df_raw = self.df_raw[self.df_raw['week_of_year'] != 37].copy()
+            
+            print(f"   → Semana 37 REMOVIDA: {week_37_records:,} registros eliminados")
+            print(f"   → Interpolação será feita automaticamente durante a agregação")
+        
         
         print(f"   → Dados carregados: {len(self.df_raw):,} registros")
         return self.df_raw
@@ -184,23 +203,71 @@ class DataProcessor:
         # Renomear colunas principais
         self.df_agg = self.df_agg.rename(columns={'quantity': 'qty', 'gross_value': 'gross'})
         
+        # INTERPOLAÇÃO: Preencher lacuna da semana 37 removida
+        if 37 not in self.df_agg['week_of_year'].values and 36 in self.df_agg['week_of_year'].values and 38 in self.df_agg['week_of_year'].values:
+            print("🔧 INTERPOLAÇÃO: Preenchendo lacuna da semana 37...")
+            self._interpolate_missing_week(37)
+        
         print(f"   → Dados agregados iniciais: {len(self.df_agg):,} registros")
-        
-        # OPÇÃO 1: Não fazer cross join completo (mais eficiente)
-        # Apenas garantir que cada combinação PDV-produto tenha pelo menos as semanas onde vendeu
-        
-        # OPÇÃO 2: Fazer cross join apenas para combinações que realmente venderam
-        # Isto é muito mais inteligente que criar 53M registros desnecessários
-        
-        # Vamos usar OPÇÃO 1 por enquanto e ver se o modelo funciona bem
-        # Se precisarmos de continuidade temporal, podemos implementar de forma mais eficiente
-        
         print(f"   → Dados agregados finais: {len(self.df_agg):,} registros")
         print(f"   → PDVs únicos: {self.df_agg['pdv'].nunique():,}")
         print(f"   → Produtos únicos: {self.df_agg['internal_product_id'].nunique():,}")
         print(f"   → Range de semanas: {self.df_agg['week_of_year'].min()}-{self.df_agg['week_of_year'].max()}")
         
         return self.df_agg
+    
+    def _interpolate_missing_week(self, missing_week):
+        """Interpola dados para uma semana ausente usando média das semanas vizinhas"""
+        print(f"   → Interpolando dados para semana {missing_week}...")
+        
+        # Identificar semanas vizinhas
+        prev_week = missing_week - 1
+        next_week = missing_week + 1
+        
+        # Buscar dados das semanas vizinhas
+        prev_data = self.df_agg[self.df_agg['week_of_year'] == prev_week].copy()
+        next_data = self.df_agg[self.df_agg['week_of_year'] == next_week].copy()
+        
+        if prev_data.empty or next_data.empty:
+            print(f"   → Aviso: Não foi possível interpolar semana {missing_week} - semanas vizinhas ausentes")
+            return
+        
+        # Fazer merge das semanas vizinhas para interpolar
+        interpolated = prev_data.merge(
+            next_data[['pdv', 'internal_product_id', 'qty', 'gross']],
+            on=['pdv', 'internal_product_id'],
+            how='outer',
+            suffixes=('_prev', '_next')
+        )
+        
+        # Calcular valores interpolados (média simples)
+        interpolated['qty'] = (
+            interpolated['qty_prev'].fillna(0) + interpolated['qty_next'].fillna(0)
+        ) / 2
+        interpolated['gross'] = (
+            interpolated['gross_prev'].fillna(0) + interpolated['gross_next'].fillna(0)
+        ) / 2
+        
+        # Preparar DataFrame interpolado
+        interpolated['week_of_year'] = missing_week
+        
+        # Manter colunas categóricas da semana anterior (ou próxima se anterior não existe)
+        categorical_cols = [col for col in interpolated.columns 
+                          if col not in ['pdv', 'internal_product_id', 'week_of_year', 'qty', 'gross'] 
+                          and not col.endswith(('_prev', '_next'))]
+        
+        for col in categorical_cols:
+            if col in interpolated.columns:
+                interpolated[col] = interpolated[col].fillna(method='ffill').fillna(method='bfill')
+        
+        # Selecionar colunas finais
+        final_cols = ['week_of_year', 'pdv', 'internal_product_id', 'qty', 'gross'] + categorical_cols
+        interpolated_final = interpolated[final_cols].copy()
+        
+        # Adicionar dados interpolados ao DataFrame principal
+        self.df_agg = pd.concat([self.df_agg, interpolated_final], ignore_index=True)
+        
+        print(f"   → Semana {missing_week} interpolada: {len(interpolated_final):,} registros adicionados")
     
     def create_lag_features(self):
         """Cria features de lag e rolling de forma vetorizada"""
@@ -217,7 +284,6 @@ class DataProcessor:
         # Features rolling
         print("  → Criando features rolling...")
         grouped = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty']
-        
         self.df_agg['rmean_4'] = grouped.shift(1).rolling(4, min_periods=1).mean()
         print("    → Média móvel 4 criada")
         
@@ -241,8 +307,8 @@ class DataProcessor:
         # Criar features categóricas
         self.create_categorical_features()
         
-        # Definir colunas de features básicas
-        base_features = ['week_of_year'] + lag_cols + ['gross']
+        # Definir colunas de features básicas (removido 'gross' para evitar data leakage)
+        base_features = ['week_of_year'] + lag_cols
         self.feature_columns = base_features + self.categorical_features
         
         print(f"   → {len(lag_cols)} features de lag criadas")
