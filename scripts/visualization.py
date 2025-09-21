@@ -189,28 +189,48 @@ class DataVisualizer:
         
         # 6. Estatísticas do Tratamento de Outliers
         if outlier_stats is not None and not outlier_stats.empty:
-            # Gráfico de pizza com tipos de grupos
-            cv_counts = []
-            cv_labels = []
+            # Verificar se é o novo método percentile_cap
+            if 'method' in outlier_stats.columns and outlier_stats['method'].iloc[0] == 'percentile_cap':
+                # Para o método percentile_cap, mostrar informações simples
+                total_outliers = outlier_stats['total_outliers'].iloc[0]
+                volume_reduction = outlier_stats['volume_reduction_pct'].iloc[0]
+                final_cap = outlier_stats['final_cap'].iloc[0]
+                
+                # Gráfico de pizza simples
+                counts = [total_outliers, 100000]  # Aproximação para visualização
+                labels = [f'Outliers Tratados\n({total_outliers:,})', 'Dados Normais']
+                colors = ['lightcoral', 'lightgreen']
+                
+                axes[2, 1].pie(counts, labels=labels, autopct='%1.1f%%', colors=colors)
+                axes[2, 1].set_title(f'🎯 Outliers Tratados\nCap: {final_cap:.0f} | Redução: {volume_reduction:.1f}%')
             
-            low_cv = (outlier_stats['cv'] < 1.0).sum()
-            med_cv = ((outlier_stats['cv'] >= 1.0) & (outlier_stats['cv'] < 2.0)).sum()
-            high_cv = (outlier_stats['cv'] >= 2.0).sum()
-            
-            if low_cv > 0:
-                cv_counts.append(low_cv)
-                cv_labels.append('Baixa Variabilidade')
-            if med_cv > 0:
-                cv_counts.append(med_cv)
-                cv_labels.append('Média Variabilidade')
-            if high_cv > 0:
-                cv_counts.append(high_cv)
-                cv_labels.append('Alta Variabilidade')
-            
-            if cv_counts:
-                axes[2, 1].pie(cv_counts, labels=cv_labels, autopct='%1.1f%%', 
-                              colors=['lightgreen', 'gold', 'lightcoral'])
-                axes[2, 1].set_title('🎚️ Grupos por Variabilidade (CV)')
+            elif 'cv' in outlier_stats.columns:
+                # Método antigo - análise por CV
+                cv_counts = []
+                cv_labels = []
+                
+                low_cv = (outlier_stats['cv'] < 1.0).sum()
+                med_cv = ((outlier_stats['cv'] >= 1.0) & (outlier_stats['cv'] < 2.0)).sum()
+                high_cv = (outlier_stats['cv'] >= 2.0).sum()
+                
+                if low_cv > 0:
+                    cv_counts.append(low_cv)
+                    cv_labels.append('Baixa Variabilidade')
+                if med_cv > 0:
+                    cv_counts.append(med_cv)
+                    cv_labels.append('Média Variabilidade')
+                if high_cv > 0:
+                    cv_counts.append(high_cv)
+                    cv_labels.append('Alta Variabilidade')
+                
+                if cv_counts:
+                    axes[2, 1].pie(cv_counts, labels=cv_labels, autopct='%1.1f%%', 
+                                  colors=['lightgreen', 'gold', 'lightcoral'])
+                    axes[2, 1].set_title('🎚️ Grupos por Variabilidade (CV)')
+                else:
+                    axes[2, 1].text(0.5, 0.5, 'Sem dados\nde outliers', ha='center', va='center', 
+                                   transform=axes[2, 1].transAxes, fontsize=12)
+                    axes[2, 1].set_title('🎚️ Estatísticas de Outliers')
             else:
                 axes[2, 1].text(0.5, 0.5, 'Sem dados\nde outliers', ha='center', va='center', 
                                transform=axes[2, 1].transAxes, fontsize=12)

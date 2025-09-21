@@ -2,10 +2,12 @@
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from .config import LAG_FEATURES, OUTLIER_PARAMS
+from .config import LAG_FEATURES, OUTLIER_PARAMS, DUMMY_FEATURES, EMBEDDING_FEATURES, EMBEDDING_CONFIG
 import warnings
 import multiprocessing as mp
 from functools import partial
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import LabelEncoder
 warnings.filterwarnings('ignore')
 
 def _process_outlier_group_wrapper(args):
@@ -15,7 +17,7 @@ def _process_outlier_group_wrapper(args):
     group.name = name
     return _process_outlier_group(group, **outlier_params)
 
-def _process_outlier_group(group, rolling_window, z_threshold, treatment, adaptive_threshold, min_observations):
+def _process_outlier_group(group, rolling_window, z_threshold, treatment, adaptive_threshold, min_observations, absolute_cap_multiplier=5):
     """Função auxiliar para processar outliers em um único grupo (para paralelização)."""
     try:
         (pdv, product) = group.name
@@ -68,11 +70,12 @@ def _process_outlier_group(group, rolling_window, z_threshold, treatment, adapti
             z_scores = np.abs((group_sorted['qty'] - rolling_mean) / rolling_std)
             outliers_mask_sorted = z_scores > threshold
             
-            # Mapear de volta para a ordem original do grupo
-            outliers_mask = np.zeros(len(group), dtype=bool)
-            for i, idx in enumerate(group_sorted.index):
-                original_pos = group.index.get_loc(idx)
-                outliers_mask[original_pos] = outliers_mask_sorted.iloc[i]
+            # Calcular Z-scores (outliers_mask_sorted é uma pd.Series com o índice ordenado)
+            z_scores = np.abs((group_sorted['qty'] - rolling_mean) / rolling_std)
+            outliers_mask_sorted = z_scores > threshold
+
+            # Mapear de volta para a ordem original usando reindex (muito mais rápido)
+            outliers_mask = outliers_mask_sorted.reindex(group.index).fillna(False).values
 
         n_outliers = np.sum(outliers_mask)
         
@@ -87,23 +90,30 @@ def _process_outlier_group(group, rolling_window, z_threshold, treatment, adapti
         if n_outliers > 0:
             group_copy = group.copy()  # Só copiar se necessário
             
+            # Aplicar cap absoluto primeiro (mais agressivo)
+            absolute_cap = mean_qty * absolute_cap_multiplier
+            extreme_mask = qty_values > absolute_cap
+            if np.any(extreme_mask):
+                group_copy.loc[extreme_mask, 'qty'] = absolute_cap
+            
             if treatment == 'winsorize':
-                # Usar numpy para cálculos de percentis (mais rápido)
-                p05, p95 = np.percentile(qty_values, [5, 95])
-                if (p95 - p05) < 0.1 * mean_qty:
-                    p05 = max(0, mean_qty - 2 * std_qty)
-                    p95 = mean_qty + 2 * std_qty
-                group_copy.loc[outliers_mask, 'qty'] = np.clip(group_copy.loc[outliers_mask, 'qty'], p05, p95)
+                # Usar percentis mais conservadores
+                p02, p98 = np.percentile(qty_values, [2, 98])
+                # Garantir que os limites são razoáveis
+                p02 = max(0, p02)
+                p98 = min(p98, mean_qty * 3)  # Cap adicional: máximo 3x a média
+                
+                group_copy.loc[outliers_mask, 'qty'] = np.clip(group_copy.loc[outliers_mask, 'qty'], p02, p98)
             
             elif treatment == 'cap':
                 # Calcular limites de forma mais conservadora
                 if n_obs >= min_observations:
-                    # Usar percentil 95 como limite superior mais seguro
-                    upper_limit = min(np.percentile(qty_values, 95), mean_qty + 2 * std_qty)
-                    lower_limit = max(0, np.percentile(qty_values, 5))
+                    # Usar percentil 90 como limite superior mais seguro (era 95)
+                    upper_limit = min(np.percentile(qty_values, 90), mean_qty + 1.5 * std_qty)
+                    lower_limit = max(0, np.percentile(qty_values, 10))
                 else:
-                    upper_limit = mean_qty + 2 * std_qty
-                    lower_limit = max(0, mean_qty - 2 * std_qty)
+                    upper_limit = mean_qty + 1.5 * std_qty
+                    lower_limit = max(0, mean_qty - 1.5 * std_qty)
                 
                 # Aplicar cap apenas para reduzir outliers, nunca aumentar
                 outlier_values = group_copy.loc[outliers_mask, 'qty']
@@ -129,6 +139,10 @@ class DataProcessor:
         self.df_raw = None
         self.df_agg = None
         self.feature_columns = None
+        self.dummy_encoders = {}
+        self.label_encoders = {}
+        self.pca_transformers = {}
+        self.categorical_features = []
         
     def load_data(self, file_path):
         """Carrega dados do arquivo parquet"""
@@ -148,11 +162,27 @@ class DataProcessor:
         """Agrega dados por semana/PDV/produto"""
         print("🔄 Agregando dados por semana/PDV/produto...")
         
-        # Agregação principal
-        self.df_agg = self.df_raw.groupby(['week_of_year', 'pdv', 'internal_product_id'], as_index=False).agg({
+        # Verificar quais colunas categóricas existem nos dados
+        available_categorical = [col for col in ['categoria', 'premise', 'subcategoria', 'tipos', 'label', 'fabricante'] 
+                               if col in self.df_raw.columns]
+        
+        print(f"   → Colunas categóricas disponíveis: {available_categorical}")
+        
+        # Preparar dicionário de agregação
+        agg_dict = {
             'quantity': 'sum',
             'gross_value': 'sum'
-        }).rename(columns={'quantity': 'qty', 'gross_value': 'gross'})
+        }
+        
+        # Para colunas categóricas, usar 'first' (assumindo que são constantes por PDV-produto)
+        for col in available_categorical:
+            agg_dict[col] = 'first'
+        
+        # Agregação principal
+        self.df_agg = self.df_raw.groupby(['week_of_year', 'pdv', 'internal_product_id'], as_index=False).agg(agg_dict)
+        
+        # Renomear colunas principais
+        self.df_agg = self.df_agg.rename(columns={'quantity': 'qty', 'gross_value': 'gross'})
         
         print(f"   → Dados agregados iniciais: {len(self.df_agg):,} registros")
         
@@ -208,30 +238,285 @@ class DataProcessor:
         lag_cols = [c for c in self.df_agg.columns if c.startswith('lag_')] + ['rmean_4', 'rstd_4', 'nonzero_frac_8']
         self.df_agg[lag_cols] = self.df_agg[lag_cols].fillna(0)
         
-        # Definir colunas de features
-        self.feature_columns = ['week_of_year'] + lag_cols + ['gross']
+        # Criar features categóricas
+        self.create_categorical_features()
         
-        print(f"   → {len(lag_cols)} features criadas")
+        # Definir colunas de features básicas
+        base_features = ['week_of_year'] + lag_cols + ['gross']
+        self.feature_columns = base_features + self.categorical_features
+        
+        print(f"   → {len(lag_cols)} features de lag criadas")
+        print(f"   → Total de features: {len(self.feature_columns)}")
         return self.df_agg
     
+    def create_categorical_features(self):
+        """Cria features categóricas usando dummização e embeddings"""
+        print("🎭 Criando features categóricas...")
+        self.categorical_features = []
+        
+        # Verificar se as colunas categóricas existem nos dados
+        available_dummy = [col for col in DUMMY_FEATURES if col in self.df_agg.columns]
+        available_embedding = [col for col in EMBEDDING_FEATURES if col in self.df_agg.columns]
+        
+        if not available_dummy and not available_embedding:
+            print("   → Nenhuma coluna categórica encontrada nos dados agregados")
+            return
+        
+        # 1. Features Dummy (One-Hot Encoding)
+        for col in available_dummy:
+            print(f"  → Criando dummies para {col}...")
+            # Verificar valores únicos e criar dummies manualmente
+            unique_values = self.df_agg[col].value_counts().head(10).index.tolist()
+            
+            for value in unique_values:
+                dummy_col = f'{col}_{value}'.replace(' ', '_').replace('-', '_')
+                self.df_agg[dummy_col] = (self.df_agg[col] == value).astype('int8')
+                self.categorical_features.append(dummy_col)
+            
+            print(f"    → {len(unique_values)} dummies criadas para {col}")
+        
+        # 2. Features de Embedding (usando PCA)
+        for col in available_embedding:
+            print(f"  → Criando embeddings para {col}...")
+            
+            # Frequência mínima para manter categorias
+            value_counts = self.df_agg[col].value_counts()
+            valid_categories = value_counts[value_counts >= EMBEDDING_CONFIG['min_frequency']].index
+            
+            # Substituir categorias raras por 'outros'
+            self.df_agg[f'{col}_processed'] = self.df_agg[col].apply(
+                lambda x: x if x in valid_categories else 'outros'
+            )
+            
+            # Label Encoding
+            le = LabelEncoder()
+            encoded_values = le.fit_transform(self.df_agg[f'{col}_processed'].fillna('outros'))
+            
+            # Se há muitas categorias únicas, usar PCA para reduzir dimensionalidade
+            n_unique = len(le.classes_)
+            if n_unique > EMBEDDING_CONFIG['max_unique_values']:
+                print(f"    → {n_unique} categorias, aplicando PCA...")
+                
+                # Criar matriz de embeddings simples (baseada em frequência e co-ocorrência)
+                embedding_matrix = self._create_simple_embeddings(self.df_agg[f'{col}_processed'], n_unique)
+                
+                # Aplicar PCA
+                pca = PCA(n_components=min(EMBEDDING_CONFIG['n_components'], n_unique-1))
+                reduced_embeddings = pca.fit_transform(embedding_matrix)
+                
+                # Mapear de volta para os dados
+                for i in range(reduced_embeddings.shape[1]):
+                    feature_name = f'{col}_emb_{i}'
+                    self.df_agg[feature_name] = reduced_embeddings[encoded_values, i]
+                    self.categorical_features.append(feature_name)
+                
+                # Salvar transformadores para predições futuras
+                self.label_encoders[col] = le
+                self.pca_transformers[col] = (pca, embedding_matrix)
+                
+                print(f"    → {reduced_embeddings.shape[1]} componentes PCA criados para {col}")
+            else:
+                # Para poucas categorias, usar embeddings simples baseados em target encoding
+                target_means = self.df_agg.groupby(f'{col}_processed')['qty'].mean()
+                self.df_agg[f'{col}_target_enc'] = self.df_agg[f'{col}_processed'].map(target_means)
+                self.categorical_features.append(f'{col}_target_enc')
+                
+                # Salvar encoder
+                self.label_encoders[col] = target_means
+                
+                print(f"    → Target encoding criado para {col}")
+            
+            # Remover coluna temporária
+            self.df_agg.drop(f'{col}_processed', axis=1, inplace=True)
+        
+        print(f"   → Total de {len(self.categorical_features)} features categóricas criadas")
+    
+    def _create_simple_embeddings(self, categorical_series, n_unique):
+        """Cria embeddings simples baseados em frequência e co-ocorrência"""
+        # Matriz simples: cada linha é uma categoria, colunas são features estatísticas
+        embedding_dim = min(20, n_unique)
+        embedding_matrix = np.zeros((n_unique, embedding_dim))
+        
+        value_counts = categorical_series.value_counts()
+        unique_values = categorical_series.unique()
+        
+        for i, value in enumerate(unique_values):
+            # Feature 1: Log da frequência
+            embedding_matrix[i, 0] = np.log1p(value_counts.get(value, 1))
+            
+            # Features adicionais: estatísticas baseadas em posição e contexto
+            if embedding_dim > 1:
+                # Usar hash simples para criar features determinísticas
+                hash_val = hash(str(value)) % 1000000
+                for j in range(1, min(embedding_dim, 10)):
+                    embedding_matrix[i, j] = (hash_val % (j * 100 + 1)) / (j * 100 + 1)
+        
+        return embedding_matrix
+
     def detect_and_treat_outliers(self, rolling_window=12, z_threshold=5.0, treatment='winsorize', 
-                                  adaptive_threshold=True, min_observations=10):
+                                  adaptive_threshold=True, min_observations=10, absolute_cap_multiplier=3,
+                                  method='median_imputation', percentile_cap=99.5, absolute_cap=220):
         """
-        Detecta e trata outliers usando rolling Z-score personalizado por PDV-produto
+        Detecta e trata outliers usando diferentes métodos
         
         Args:
+            method (str): 'percentile_cap', 'z_score', 'median_imputation', ou 'hybrid'
+            percentile_cap (float): Percentil para cap (ex: 95.0)
+            absolute_cap (float): Cap absoluto como backup
             rolling_window (int): Tamanho da janela rolling para calcular média e desvio
             z_threshold (float): Threshold base do Z-score para considerar outlier
-            treatment (str): Tipo de tratamento ('winsorize', 'remove', 'cap')
+            treatment (str): Tipo de tratamento ('winsorize', 'remove', 'cap', 'median_impute')
             adaptive_threshold (bool): Se True, ajusta threshold baseado nas características do grupo
             min_observations (int): Mínimo de observações para calcular estatísticas confiáveis
+            absolute_cap_multiplier (float): Cap absoluto como múltiplo da média do grupo (método antigo)
         """
-        return self._detect_and_treat_outliers(rolling_window, z_threshold, treatment, 
-                                                           adaptive_threshold, min_observations)
+        
+        if method == 'median_imputation':
+            return self._median_imputation_outliers(percentile_cap, absolute_cap)
+        elif method == 'percentile_cap':
+            return self._percentile_cap_outliers(percentile_cap, absolute_cap)
+        else:
+            return self._detect_and_treat_outliers(rolling_window, z_threshold, treatment, 
+                                                               adaptive_threshold, min_observations, absolute_cap_multiplier)
+    
+    def _median_imputation_outliers(self, percentile_cap=95.0, absolute_cap=24, rolling_window=12):
+        """
+        Método de imputação por mediana: substitui outliers pela mediana usando apenas dados passados
+        """
+        print(f"🎯 Aplicando imputacao por mediana para outliers...")
+        print(f"   → Metodo: Detectar outliers usando janela rolling de {rolling_window} semanas")
+        print(f"   → Percentil: {percentile_cap}% | Cap absoluto: {absolute_cap}")
+        
+        # Ordenar dados por PDV, produto e semana
+        self.df_agg = self.df_agg.sort_values(['pdv', 'internal_product_id', 'week_of_year']).reset_index(drop=True)
+        
+        # Calcular estatísticas antes
+        total_records = len(self.df_agg)
+        total_volume_before = self.df_agg['qty'].sum()
+        
+        print(f"   → Processando {total_records:,} registros de forma vetorizada...")
+        
+        # Usar operações vetorizadas para calcular rolling statistics com shift=1 (sem data leakage)
+        grouped = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty']
+        
+        # Calcular estatísticas rolling usando apenas dados passados (shift=1)
+        rolling_median = grouped.shift(1).rolling(rolling_window, min_periods=3).median()
+        rolling_percentile = grouped.shift(1).rolling(rolling_window, min_periods=3).quantile(percentile_cap / 100)
+        
+        # Aplicar cap absoluto e percentil (usar o menor)
+        outlier_threshold = np.minimum(rolling_percentile.fillna(absolute_cap), absolute_cap)
+        
+        # Identificar outliers de forma vetorizada
+        outliers_mask = (self.df_agg['qty'] > outlier_threshold) & (outlier_threshold.notna())
+        
+        # Contar outliers
+        outliers_count = outliers_mask.sum()
+        outliers_volume = self.df_agg.loc[outliers_mask, 'qty'].sum()
+        
+        # Imputar outliers com a mediana rolling (apenas dados passados)
+        self.df_agg.loc[outliers_mask, 'qty'] = rolling_median.loc[outliers_mask]
+        
+        # Para casos onde rolling_median é NaN, usar valor conservador (mínimo entre 1 e valor original)
+        still_nan_mask = outliers_mask & self.df_agg['qty'].isna()
+        if still_nan_mask.any():
+            self.df_agg.loc[still_nan_mask, 'qty'] = 1.0  # Valor conservador para casos extremos
+        
+        # Estatísticas após tratamento
+        total_volume_after = self.df_agg['qty'].sum()
+        volume_reduction = ((total_volume_before - total_volume_after) / total_volume_before) * 100
+        
+        # Calcular estatísticas para o relatório
+        final_median = self.df_agg['qty'].median()
+        final_max = self.df_agg['qty'].max()
+        final_mean = self.df_agg['qty'].mean()
+        
+        print(f"\n📊 RESULTADO DA IMPUTAÇÃO POR MEDIANA:")
+        print(f"   → Registros afetados: {outliers_count:,} ({outliers_count/total_records*100:.3f}%)")
+        print(f"   → Volume antes: {total_volume_before:,.0f}")
+        print(f"   → Volume depois: {total_volume_after:,.0f}")
+        print(f"   → Redução de volume: {volume_reduction:.1f}%")
+        print(f"   → Novo máximo: {final_max:.1f}")
+        print(f"   → Nova média: {final_mean:.2f}")
+        print(f"   → Nova mediana: {final_median:.1f}")
+        
+        # Criar estatísticas para compatibilidade
+        self.outlier_stats = pd.DataFrame({
+            'method': ['median_imputation_no_leakage'],
+            'total_outliers': [outliers_count],
+            'volume_reduction_pct': [volume_reduction],
+            'threshold_used': [absolute_cap],  # Cap absoluto como referência
+            'final_median': [final_median]
+        })
+        
+        print("✅ Imputação por mediana concluída!")
+        return self.df_agg
+    
+    def _percentile_cap_outliers(self, percentile_cap=99.5, absolute_cap=220, rolling_window=12):
+        """
+        Método mais robusto OTIMIZADO: cap baseado em percentil usando apenas dados passados
+        """
+        print(f"🎯 Aplicando tratamento robusto de outliers...")
+        print(f"   → Metodo: Cap baseado em percentil {percentile_cap}% + cap absoluto {absolute_cap}")
+        print(f"   → Janela rolling: {rolling_window} semanas")
+        
+        # Ordenar dados por PDV, produto e semana
+        self.df_agg = self.df_agg.sort_values(['pdv', 'internal_product_id', 'week_of_year']).reset_index(drop=True)
+        
+        # Calcular estatísticas antes
+        total_records = len(self.df_agg)
+        total_volume_before = self.df_agg['qty'].sum()
+        
+        print(f"   → Processando {total_records:,} registros de forma vetorizada...")
+        
+        # Usar operações vetorizadas para calcular rolling statistics com shift=1
+        grouped = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty']
+        
+        # Calcular cap rolling usando apenas dados passados (shift=1)
+        rolling_percentile = grouped.shift(1).rolling(rolling_window, min_periods=3).quantile(percentile_cap / 100)
+        
+        # Aplicar cap absoluto e percentil (usar o menor)
+        final_cap = np.minimum(rolling_percentile.fillna(absolute_cap), absolute_cap)
+        
+        # Identificar outliers de forma vetorizada
+        outliers_mask = (self.df_agg['qty'] > final_cap) & (final_cap.notna())
+        
+        # Contar outliers
+        outliers_count = outliers_mask.sum()
+        outliers_volume = (self.df_agg.loc[outliers_mask, 'qty'] - final_cap.loc[outliers_mask]).sum()
+        
+        # Aplicar cap de forma vetorizada
+        self.df_agg.loc[outliers_mask, 'qty'] = final_cap.loc[outliers_mask]
+        
+        # Estatísticas após tratamento
+        total_volume_after = self.df_agg['qty'].sum()
+        volume_reduction = ((total_volume_before - total_volume_after) / total_volume_before) * 100
+        
+        # Calcular estatísticas finais
+        final_max = self.df_agg['qty'].max()
+        final_mean = self.df_agg['qty'].mean()
+        
+        print(f"\n📊 RESULTADO DO TRATAMENTO ROBUSTO:")
+        print(f"   → Registros afetados: {outliers_count:,} ({outliers_count/total_records*100:.3f}%)")
+        print(f"   → Volume antes: {total_volume_before:,.0f}")
+        print(f"   → Volume depois: {total_volume_after:,.0f}")
+        print(f"   → Redução de volume: {volume_reduction:.1f}%")
+        print(f"   → Novo máximo: {final_max:.1f}")
+        print(f"   → Nova média: {final_mean:.2f}")
+        
+        # Criar estatísticas para compatibilidade
+        self.outlier_stats = pd.DataFrame({
+            'method': ['percentile_cap_no_leakage'],
+            'total_outliers': [outliers_count],
+            'volume_reduction_pct': [volume_reduction],
+            'final_cap': [absolute_cap]  # Cap absoluto como referência
+        })
+        
+        print("✅ Tratamento robusto de outliers concluído!")
+        return self.df_agg
 
     def _detect_and_treat_outliers(self, rolling_window=12, z_threshold=5.0, 
                                                treatment='winsorize', adaptive_threshold=True, 
-                                               min_observations=10):
+                                               min_observations=10, absolute_cap_multiplier=3.0):
         """
         Versão otimizada para detecção e tratamento de outliers por PDV-produto.
         """
@@ -252,7 +537,8 @@ class DataProcessor:
             'z_threshold': z_threshold,
             'treatment': treatment,
             'adaptive_threshold': adaptive_threshold,
-            'min_observations': min_observations
+            'min_observations': min_observations,
+            'absolute_cap_multiplier': absolute_cap_multiplier
         }
 
         # Criar argumentos para a função wrapper
@@ -271,8 +557,6 @@ class DataProcessor:
             with tqdm(total=n_groups, desc="Analisando grupos PDV-produto") as pbar:
                 # Usar imap com chunksize para melhor performance
                 for result in pool.imap(_process_outlier_group_wrapper, args_list, chunksize=chunksize):
-                    results.append(result)
-                    pbar.update()
                     results.append(result)
                     pbar.update()
 
@@ -365,7 +649,49 @@ class DataProcessor:
                 'detailed_stats': stats
             }
         
-        # Verificar se as colunas necessárias existem
+        # Verificar se é o novo método median_imputation
+        if 'method' in stats.columns and not stats.empty:
+            method_name = stats['method'].iloc[0]
+            
+            if method_name in ['median_imputation']:
+                print("📊 ANÁLISE DETALHADA DO TRATAMENTO DE OUTLIERS:")
+                print("="*60)
+                print(f"✅ Método aplicado: {method_name}")
+                print(f"   → Total de outliers tratados: {stats['total_outliers'].iloc[0]:,}")
+                print(f"   → Redução de volume: {stats['volume_reduction_pct'].iloc[0]:.1f}%")
+                
+                if 'final_median' in stats.columns:
+                    print(f"   → Mediana final: {stats['final_median'].iloc[0]:.1f}")
+                elif 'median_value' in stats.columns:
+                    print(f"   → Valor da mediana: {stats['median_value'].iloc[0]:.1f}")
+                    
+                print("   → Tratamento por imputação com mediana - muito conservador!")
+                return {
+                    'total_groups': 1,
+                    'groups_with_outliers': 1 if stats['total_outliers'].iloc[0] > 0 else 0,
+                    'total_outliers': stats['total_outliers'].iloc[0],
+                    'method': method_name,
+                    'detailed_stats': stats
+                }
+            
+            elif method_name in ['percentile_cap']:
+                print("📊 ANÁLISE DETALHADA DO TRATAMENTO DE OUTLIERS:")
+                print("="*60)
+                print(f"✅ Método aplicado: {method_name}")
+                print(f"   → Total de outliers tratados: {stats['total_outliers'].iloc[0]:,}")
+                print(f"   → Redução de volume: {stats['volume_reduction_pct'].iloc[0]:.1f}%")
+                print(f"   → Cap aplicado: {stats['final_cap'].iloc[0]:.0f}")
+                    
+                print("   → Tratamento baseado em percentil - mais robusto!")
+                return {
+                    'total_groups': 1,
+                    'groups_with_outliers': 1 if stats['total_outliers'].iloc[0] > 0 else 0,
+                    'total_outliers': stats['total_outliers'].iloc[0],
+                    'method': method_name,
+                    'detailed_stats': stats
+                }
+        
+        # Verificar se as colunas necessárias existem (método antigo)
         required_cols = ['n_outliers', 'pdv', 'product', 'cv', 'zero_pct', 'mean_qty', 'threshold_used']
         missing_cols = [col for col in required_cols if col not in stats.columns]
         if missing_cols:

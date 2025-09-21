@@ -8,8 +8,126 @@ import os
 from .config import MODEL_PARAMS, TRAINING_PARAMS, PREDICTION_WEEKS
 from datetime import datetime
 import warnings
+import multiprocessing as mp
+from tqdm import tqdm
+from functools import partial
+import traceback # Importar para depuração
+
 warnings.filterwarnings('ignore')
 
+def _process_prediction_chunk(chunk_args):
+    """Função auxiliar para processar chunks de predições em paralelo"""
+    chunk_data, model, feature_columns, weeks = chunk_args
+    chunk_results = []
+    for pdv, sku, hist_data in chunk_data:
+        # A função de predição agora pode imprimir erros detalhados
+        predictions = _predict_single_optimized_static(pdv, sku, hist_data, model, feature_columns, weeks)
+        chunk_results.extend(predictions)
+    return chunk_results
+
+def _predict_single_optimized_static(pdv, sku, hist_data, model, feature_columns, weeks):
+    """Versão estática otimizada de predição para uma combinação"""
+    try:
+        predictions = []
+        current_data = hist_data.copy()
+        
+        for week in weeks:
+            features = _calculate_features_fast_static(current_data)
+            
+            if features is not None and len(features) == len(feature_columns):
+                pred = model.predict(np.array([features]))[0]
+                pred = max(0, pred)
+                
+                predictions.append({
+                    'pdv': pdv,
+                    'internal_product_id': sku,
+                    'week': week,
+                    'predicted_qty': pred
+                })
+                
+                new_row = pd.DataFrame({
+                    'week_of_year': [current_data['week_of_year'].max() + 1],
+                    'pdv': [pdv], 'internal_product_id': [sku], 'qty': [pred]
+                })
+                
+                # Copiar features categóricas do último registro
+                last_row = current_data.iloc[-1]
+                for col in current_data.columns:
+                    if (col.startswith(('categoria_', 'premise_')) or 
+                        col.endswith(('_target_enc', '_emb_0', '_emb_1', '_emb_2', '_emb_3', '_emb_4', 
+                                     '_emb_5', '_emb_6', '_emb_7', '_emb_8', '_emb_9')) or
+                        col in ['categoria', 'premise', 'subcategoria', 'tipos', 'label', 'fabricante', 'gross']):
+                        if col not in new_row.columns:
+                            new_row[col] = last_row[col]
+                
+                current_data = pd.concat([current_data, new_row], ignore_index=True)
+                
+                if len(current_data) > 20:
+                    current_data = current_data.tail(20)
+        return predictions
+    
+    except Exception as e:
+        print(f"--- ERRO ao prever para PDV {pdv}, SKU {sku}: {e} ---")
+        traceback.print_exc()
+        return []
+    
+def _calculate_features_fast_static(data):
+    """Calcula features de forma otimizada usando numpy (versão estática)"""
+    try:
+        if len(data) < 1:
+            return None
+            
+        qty_values = data['qty'].values
+        current_week = data['week_of_year'].iloc[-1] + 1
+        
+        features = [current_week]
+        
+        # Lags
+        for lag in [1, 2, 3, 4, 8, 12]:
+            features.append(qty_values[-lag] if len(qty_values) >= lag else 0)
+
+        # Dados para rolling (todos exceto o mais recente)
+        rolling_data = qty_values[:-1] if len(qty_values) > 1 else qty_values
+
+        # Rolling means/std sobre os últimos 4 pontos *do passado*
+        if len(rolling_data) >= 4:
+            window = rolling_data[-4:]
+            features.append(np.mean(window))  # rmean_4
+            features.append(np.std(window))   # rstd_4
+        else: # Se não houver dados suficientes, usar a média/std de tudo que tiver
+            features.append(np.mean(rolling_data) if len(rolling_data) > 0 else 0)
+            features.append(np.std(rolling_data) if len(rolling_data) > 1 else 0)
+        
+        # Fração de não zeros sobre os últimos 8 pontos *do passado*
+        if len(rolling_data) >= 8:
+            features.append(np.mean(rolling_data[-8:] > 0))  # nonzero_frac_8
+        else:
+            features.append(np.mean(rolling_data > 0) if len(rolling_data) > 0 else 0)
+        
+        features.append(qty_values[-1] * 10 if len(qty_values) > 0 else 0)
+        
+        # Adicionar features categóricas do último registro
+        # Estas features são constantes para cada combinação PDV-produto
+        last_row = data.iloc[-1]
+        
+        # Features dummy - verificar se existem nas colunas
+        for col in data.columns:
+            if col.startswith(('categoria_', 'premise_')):
+                features.append(last_row[col] if col in data.columns else 0)
+        
+        # Features de embedding - verificar se existem nas colunas  
+        for col in data.columns:
+            if col.endswith(('_target_enc', '_emb_0', '_emb_1', '_emb_2', '_emb_3', '_emb_4', 
+                           '_emb_5', '_emb_6', '_emb_7', '_emb_8', '_emb_9')):
+                features.append(last_row[col] if col in data.columns else 0)
+        
+        return features
+        
+    except Exception as e:
+        # Também podemos adicionar depuração aqui se necessário
+        print(f"--- ERRO em _calculate_features_fast_static: {e} ---")
+        return None
+    
 class LightGBMModel:
     """Classe para treinamento e predição com LightGBM"""
     
@@ -60,19 +178,21 @@ class LightGBMModel:
         return None
     
     def predict(self, X):
-        """Faz predições com o modelo treinado"""
+        """Faz predições com o modelo treinado, lidando com a mudança de versão do LightGBM."""
         if self.model is None:
             raise ValueError("Modelo não foi treinado. Execute train() primeiro.")
         
-        # Usar best_iteration se disponível, senão usar todas as iterações
-        if self.best_iteration is not None:
-            try:
-                return self.model.predict(X, num_iteration=self.best_iteration)
-            except TypeError:
-                # Para versões mais recentes do LightGBM
-                return self.model.predict(X, iteration=self.best_iteration)
-        else:
+        if self.best_iteration is None:
             return self.model.predict(X)
+
+        # Use num_iteration instead of iteration (deprecated in newer LightGBM versions)
+        try:
+            return self.model.predict(X, num_iteration=self.best_iteration)
+        except (TypeError, ValueError):
+            try:
+                return self.model.predict(X, iteration=self.best_iteration)
+            except:
+                return self.model.predict(X)
     
     def get_feature_importance(self, importance_type='gain', max_features=None):
         """Retorna feature importance"""
@@ -124,8 +244,6 @@ class LightGBMModel:
         print(f"   → Treinado em: {model_data.get('timestamp', 'Desconhecido')}")
 
 class Predictor:
-    """Classe para gerar predições para novas semanas"""
-    
     def __init__(self, model, feature_columns):
         self.model = model
         self.feature_columns = feature_columns
@@ -133,25 +251,47 @@ class Predictor:
     def predict_single_combination(self, pdv, sku, hist_data, weeks=None):
         """Prediz vendas para uma combinação PDV-produto específica"""
         weeks = weeks or PREDICTION_WEEKS
-        
-        last_series = hist_data['qty'].values.tolist()
-        last_gross = hist_data['gross'].values.tolist()
         predictions = []
         
-        lags = last_series.copy()
+        # VALIDAR PDV ANTES DO PROCESSAMENTO
+        try:
+            # Garantir que PDV seja numérico
+            if isinstance(pdv, str) and not pdv.isdigit():
+                print(f"⚠️ PDV inválido encontrado: {pdv}. Pulando...")
+                return []
+            
+            pdv = int(pdv)  # Converter para inteiro
+            sku = int(sku)  # Garantir que SKU também seja inteiro
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ Erro ao converter PDV/SKU: pdv={pdv}, sku={sku}. Erro: {e}")
+            return []
+        
+        lags = hist_data['qty'].values.tolist()
+        last_gross = hist_data['gross'].values.tolist()
+        
+        # Extrair features categóricas do último registro (são constantes para cada PDV-produto)
+        last_row = hist_data.iloc[-1]
+        categorical_features = {}
+        
+        # Features dummy
+        for col in hist_data.columns:
+            if col.startswith(('categoria_', 'premise_')):
+                categorical_features[col] = last_row[col]
+        
+        # Features de embedding
+        for col in hist_data.columns:
+            if col.endswith(('_target_enc', '_emb_0', '_emb_1', '_emb_2', '_emb_3', '_emb_4', 
+                           '_emb_5', '_emb_6', '_emb_7', '_emb_8', '_emb_9')):
+                categorical_features[col] = last_row[col]
         
         for week in weeks:
-            # Construir features
-            feat = {
-                'week_of_year': week,
-                'gross': last_gross[-1] if last_gross else 0
-            }
+            feat = {'week_of_year': week, 'gross': last_gross[-1] if last_gross else 0}
             
-            # Lags
+            # Features de lag
             for lag in [1, 2, 3, 4, 8, 12]:
                 feat[f'lag_{lag}'] = lags[-lag] if len(lags) >= lag else 0
             
-            # Rolling features
+            # Features rolling
             recent_values = lags[-4:] if len(lags) >= 4 else lags
             feat['rmean_4'] = np.mean(recent_values) if recent_values else 0
             feat['rstd_4'] = np.std(recent_values) if len(recent_values) > 1 else 0
@@ -159,19 +299,28 @@ class Predictor:
             nonzero_values = lags[-8:] if len(lags) >= 8 else lags
             feat['nonzero_frac_8'] = np.mean([1 if x > 0 else 0 for x in nonzero_values]) if nonzero_values else 0
             
-            # Fazer predição
-            X_row = pd.DataFrame([feat])[self.feature_columns]
-            pred = max(0, self.model.predict(X_row)[0])
-            pred_int = int(round(pred))
+            # Adicionar features categóricas
+            feat.update(categorical_features)
             
+            # Criar DataFrame e selecionar apenas as features que o modelo conhece
+            X_row = pd.DataFrame([feat])
+            
+            # Garantir que todas as features do modelo estão presentes
+            for col in self.feature_columns:
+                if col not in X_row.columns:
+                    X_row[col] = 0
+            
+            X_row = X_row[self.feature_columns]
+            pred = max(0, self.model.predict(X_row)[0])
+            
+            # Padronização dos nomes das colunas de saída para evitar inconsistências.
             predictions.append({
-                'semana': week,
                 'pdv': int(pdv),
-                'produto': int(sku),
-                'quantidade': pred_int
+                'internal_product_id': int(sku),
+                'week': week,
+                'predicted_qty': pred  # Usar o valor float, consistente com a outra função
             })
             
-            # Atualizar lags para próxima iteração
             lags.append(pred)
             if last_gross:
                 last_gross.append(last_gross[-1])
@@ -180,163 +329,75 @@ class Predictor:
     
     def predict_all_combinations(self, aggregated_data, weeks=None, parallel=True):
         """Prediz para todas as combinações PDV-produto de forma otimizada"""
-        import multiprocessing as mp
-        from tqdm import tqdm
-        from functools import partial
-        
         print("🔮 Gerando predições de forma otimizada...")
         weeks = weeks or PREDICTION_WEEKS
         
-        # Obter combinações únicas
-        pdv_prod_list = aggregated_data[['pdv', 'internal_product_id']].drop_duplicates().values
-        print(f"   → {len(pdv_prod_list):,} combinações PDV-produto para predizer")
+        # FILTRAR PDVs INVÁLIDOS (como 'desconhecido') ANTES DO PROCESSAMENTO
+        print("   → Filtrando dados inválidos...")
+        original_count = len(aggregated_data)
         
-        # Pré-agrupar dados históricos de forma mais eficiente
-        hist_data_map = {}
-        for (pdv, sku), group in aggregated_data.groupby(['pdv', 'internal_product_id']):
-            hist_data_map[(pdv, sku)] = group.sort_values('week_of_year')
+        # Remover registros com PDV não numérico
+        aggregated_data_clean = aggregated_data[
+            aggregated_data['pdv'].astype(str).str.isdigit()
+        ].copy()
         
-        print(f"   → Dados históricos preparados para {len(hist_data_map):,} grupos")
+        # Converter PDV para inteiro para garantir consistência
+        aggregated_data_clean['pdv'] = aggregated_data_clean['pdv'].astype(int)
         
+        filtered_count = len(aggregated_data_clean)
+        if original_count != filtered_count:
+            print(f"   → Removidos {original_count - filtered_count:,} registros com PDV inválido")
+        
+        pdv_prod_list = aggregated_data_clean[['pdv', 'internal_product_id']].drop_duplicates().values
+        print(f"   → {len(pdv_prod_list):,} combinações totais encontradas")
+        
+        hist_data_map = {
+            (pdv, sku): group.sort_values('week_of_year')
+            for (pdv, sku), group in aggregated_data_clean.groupby(['pdv', 'internal_product_id'])
+        }
+        
+        valid_tasks = []
+        for pdv, sku in pdv_prod_list:
+            hist = hist_data_map.get((pdv, sku))
+            # Adicionado comentário explicativo sobre o filtro que pode causar predições vazias.
+            if hist is not None and not hist.empty and len(hist) >= 3:
+                valid_tasks.append((pdv, sku, hist))
+        
+        print(f"   → {len(valid_tasks):,} combinações válidas (com histórico >= 3 semanas) para predição")
+        
+        if len(valid_tasks) == 0:
+            print("   → ⚠️ Nenhuma combinação atendeu aos critérios de histórico mínimo. Retornando DataFrame vazio.")
+            return pd.DataFrame() # Retorna DF vazio para evitar o erro `KeyError`
+
         all_predictions = []
         
-        if parallel and len(pdv_prod_list) > 100:  # Só usar paralelo se valer a pena
-            # Filtrar combinações válidas
-            valid_tasks = []
-            for pdv, sku in pdv_prod_list:
-                hist = hist_data_map.get((pdv, sku))
-                if hist is not None and not hist.empty and len(hist) >= 3:  # Mínimo histórico
-                    valid_tasks.append((pdv, sku, hist))
-            
-            print(f"   → {len(valid_tasks):,} combinações válidas para predição")
-            
-            # Otimização: usar chunksize maior para reduzir overhead
+        if parallel and len(valid_tasks) > 100:
             num_processes = min(mp.cpu_count(), len(valid_tasks))
-            chunksize = max(1, len(valid_tasks) // (num_processes * 2))  # Chunks maiores
-            
+            chunksize = max(1, len(valid_tasks) // (num_processes * 4))
             print(f"   → Utilizando {num_processes} processos com chunksize {chunksize}")
             
-            # Criar função para processamento em lote
-            def process_chunk(chunk_data):
-                chunk_results = []
-                for pdv, sku, hist_data in chunk_data:
-                    try:
-                        predictions = self._predict_single_optimized(pdv, sku, hist_data, weeks)
-                        chunk_results.extend(predictions)
-                    except Exception as e:
-                        # Continuar mesmo se uma predição falhar
-                        continue
-                return chunk_results
-            
-            # Dividir em chunks
             chunks = [valid_tasks[i:i + chunksize] for i in range(0, len(valid_tasks), chunksize)]
+            chunk_args = [(chunk, self.model, self.feature_columns, weeks) for chunk in chunks]
             
-            # Processamento paralelo com chunks
             with mp.Pool(processes=num_processes) as pool:
                 results = list(tqdm(
-                    pool.imap(process_chunk, chunks), 
-                    total=len(chunks),
-                    desc="Predições (chunks)"
+                    pool.imap(_process_prediction_chunk, chunk_args), 
+                    total=len(chunks), desc="Predições (chunks)"
                 ))
             
-            # Achatar resultados
             for result_list in results:
                 all_predictions.extend(result_list)
-                
         else:
-            # Processamento sequencial otimizado
             print("   → Usando processamento sequencial otimizado")
-            for pdv, sku in tqdm(pdv_prod_list, desc="Predições"):
-                hist = hist_data_map.get((pdv, sku))
-                if hist is not None and not hist.empty and len(hist) >= 3:
-                    try:
-                        predictions = self._predict_single_optimized(pdv, sku, hist, weeks)
-                        all_predictions.extend(predictions)
-                    except Exception:
-                        continue
+            for pdv, sku, hist in tqdm(valid_tasks, desc="Predições"):
+                try:
+                    predictions = _predict_single_optimized_static(pdv, sku, hist, self.model, self.feature_columns, weeks)
+                    all_predictions.extend(predictions)
+                except Exception:
+                    continue
         
         print(f"   → {len(all_predictions):,} predições geradas")
         return pd.DataFrame(all_predictions)
-    
-    def _predict_single_optimized(self, pdv, sku, hist_data, weeks):
-        """Versão otimizada de predição para uma combinação"""
-        try:
-            predictions = []
-            current_data = hist_data.copy()
-            
-            for week in weeks:
-                # Calcular features de forma otimizada
-                features = self._calculate_features_fast(current_data)
-                
-                if features is not None and len(features) == len(self.feature_columns):
-                    # Predição usando numpy para velocidade
-                    pred = self.model.predict([features], num_iteration=self.model.best_iteration)[0]
-                    pred = max(0, pred)  # Não permitir predições negativas
-                    
-                    predictions.append({
-                        'pdv': pdv,
-                        'internal_product_id': sku,
-                        'week': week,
-                        'predicted_qty': pred
-                    })
-                    
-                    # Adicionar predição ao histórico para próxima semana
-                    new_row = pd.DataFrame({
-                        'week_of_year': [current_data['week_of_year'].max() + 1],
-                        'pdv': [pdv],
-                        'internal_product_id': [sku],
-                        'qty': [pred]
-                    })
-                    current_data = pd.concat([current_data, new_row], ignore_index=True)
-                    
-                    # Manter apenas últimas N semanas para eficiência
-                    if len(current_data) > 20:
-                        current_data = current_data.tail(20)
-                        
-            return predictions
-            
-        except Exception as e:
-            return []
-    
-    def _calculate_features_fast(self, data):
-        """Calcula features de forma otimizada usando numpy"""
-        try:
-            if len(data) < 1:
-                return None
-                
-            qty_values = data['qty'].values
-            current_week = data['week_of_year'].iloc[-1] + 1
-            
-            # Features básicas
-            features = [current_week]  # week_of_year
-            
-            # Lags - usar indexação numpy direta
-            for lag in [1, 2, 3, 4, 8, 12]:
-                if len(qty_values) >= lag:
-                    features.append(qty_values[-lag])
-                else:
-                    features.append(0)
-            
-            # Rolling means/std - usar numpy para velocidade
-            if len(qty_values) >= 4:
-                features.append(np.mean(qty_values[-4:]))  # rmean_4
-                features.append(np.std(qty_values[-4:]))   # rstd_4
-            else:
-                features.extend([0, 0])
-            
-            # Fração de não zeros
-            if len(qty_values) >= 8:
-                features.append(np.mean(qty_values[-8:] > 0))  # nonzero_frac_8
-            else:
-                features.append(0)
-            
-            # Gross (assumir proporcional à quantidade)
-            features.append(qty_values[-1] * 10 if len(qty_values) > 0 else 0)
-            
-            return features
-            
-        except Exception:
-            return None
 
 def train_model(data_dict, save_model_path=None):
     """Função principal para treinar modelo"""
@@ -363,9 +424,17 @@ def generate_predictions(model, data_dict, weeks=None, parallel=True, save_path=
         parallel=parallel
     )
     
+    # Reordenar colunas para o formato solicitado: semana, pdv, produto, quantidade
+    predictions_formatted = pd.DataFrame({
+        'semana': predictions_df['week'].astype(int),
+        'pdv': predictions_df['pdv'].astype(int),
+        'produto': predictions_df['internal_product_id'].astype(int),
+        'quantidade': predictions_df['predicted_qty'].round().astype(int)  # ARREDONDAR PARA INTEIRO
+    })
+    
     # Salvar predições se caminho fornecido
     if save_path:
-        predictions_df.to_csv(save_path, sep=';', index=False, encoding='utf-8')
+        predictions_formatted.to_csv(save_path, sep=';', index=False, encoding='utf-8')
         print(f"💾 Predições salvas em: {save_path}")
     
-    return predictions_df
+    return predictions_formatted

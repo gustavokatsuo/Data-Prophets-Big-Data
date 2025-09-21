@@ -131,12 +131,12 @@ def main():
     print("📈 RESUMO DOS RESULTADOS:")
     print(f"• Total de predições: {len(predictions_df):,}")
     print(f"• PDVs únicos: {predictions_df['pdv'].nunique():,}")
-    print(f"• Produtos únicos: {predictions_df['produto'].nunique():,}")
+    print(f"• Produtos únicos: {predictions_df['internal_product_id'].nunique():,}")
     print(f"• WMAPE do modelo: {wmape:.4f}")
     
     # Estatísticas por semana
-    pred_stats = predictions_df.groupby('semana')['quantidade'].sum()
-    print("\\n🔮 PREDIÇÕES POR SEMANA:")
+    pred_stats = predictions_df.groupby('week')['predicted_qty'].sum()
+    print("\n🔮 PREDIÇÕES POR SEMANA:")
     for week in PREDICTION_WEEKS:
         if week in pred_stats.index:
             print(f"  Semana {week}: {pred_stats[week]:>10,} unidades")
@@ -170,4 +170,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == '--quick':
         run_quick_analysis()
     else:
-        main()
+        main()  
