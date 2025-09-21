@@ -1,5 +1,4 @@
 # Configurações globais do projeto
-from cmath import inf
 import os
 from multiprocessing import cpu_count
 
@@ -49,8 +48,8 @@ EMBEDDING_CONFIG = {
 
 # Divisão temporal
 TRAIN_CUTOFF = 44  # Semanas <= 44 para treino
-VALID_START = 45   # Semanas 45-52 para validação
-VALID_END = 52
+VALID_START = 45   # Semanas 45-48 para validação
+VALID_END = 48
 
 # Predições
 PREDICTION_WEEKS = [1, 2, 3, 4, 5]  # Janeiro 2023
@@ -65,7 +64,6 @@ PLOT_CONFIG = {
 
 # Parâmetros de detecção e tratamento de outliers
 OUTLIER_PARAMS = {
-<<<<<<< HEAD
     'method': 'z_score',                   # Método Z-score com winsorização
     'percentile_cap': 98.0,                # Percentil alto para preservar mais dados
     'absolute_cap': float('inf'),          # Sem cap absoluto para preservar sazonalidade
@@ -75,16 +73,6 @@ OUTLIER_PARAMS = {
     'adaptive_threshold': True,            # Ajuste adaptativo por características do grupo
     'min_observations': 8,                 # Mínimo de observações para cálculos confiáveis
     'absolute_cap_multiplier': 5.0         # Cap como múltiplo da média (backup)
-=======
-    'method': 'z_score',               # Método de detecção
-    'percentile_cap': 90.0,            # Detectar outliers acima de P90
-    'absolute_cap': inf,               # Detectar outliers acima de 24 unidades (infinito desabilita)
-    'rolling_window': 6,               # Mantido para compatibilidade
-    'z_threshold': 4.0,                # Threshold mais agressivo se usar Z-score
-    'treatment': 'winsorize',          # IMPUTAR COM WINSORIZAÇÃO
-    'adaptive_threshold': True,        # Ajusta threshold baseado nas características do grupo
-    'min_observations': 10             # Mínimo de observações para estatísticas confiáveis
->>>>>>> c58a2787c361521d7728d29ce032232d5ac29c05
 }
 
 # Configurações de processamento
