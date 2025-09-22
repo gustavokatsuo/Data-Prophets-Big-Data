@@ -10,3 +10,4 @@ scipy
 notebook
 tensorflow>=2.10.0
 tqdm
+xgboost

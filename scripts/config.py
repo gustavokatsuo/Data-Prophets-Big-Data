@@ -11,16 +11,30 @@ MODELS_DIR = 'models'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# Parâmetros do modelo
+# Parâmetros do modelo LightGBM
 MODEL_PARAMS = {
     'objective': 'regression',
     'metric': 'mae',
-    'learning_rate': 0.05,
-    'num_leaves': 64,
+    'learning_rate': 0.02,
+    'num_leaves': 32,
     'min_data_in_leaf': 20,
     'verbose': -1, 
     'seed': 42,
     'num_threads': cpu_count()
+}
+
+# Parâmetros do modelo XGBoost
+XGBOOST_PARAMS = {
+    'objective': 'reg:squarederror',
+    'eval_metric': 'mae',
+    'learning_rate': 0.02,
+    'max_depth': 6,
+    'min_child_weight': 20,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'seed': 42,
+    'nthread': cpu_count(),
+    'silent': 1
 }
 
 # Parâmetros de treinamento

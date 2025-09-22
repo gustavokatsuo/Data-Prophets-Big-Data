@@ -29,14 +29,14 @@ def _predict_batch_optimized(batch_data, model, feature_columns, weeks):
             if cache_key not in categorical_cache:
                 last_row = hist_data.iloc[-1]
                 dummy_cols = [col for col in hist_data.columns if col.startswith(('categoria_', 'premise_'))]
-                emb_cols = [col for col in hist_data.columns if col.endswith(('_target_enc', '_emb_0', '_emb_1', '_emb_2', '_emb_3', '_emb_4', 
-                                   '_emb_5', '_emb_6', '_emb_7', '_emb_8', '_emb_9'))]
+                # ATUALIZADO: remover referências a target_enc e embeddings complexos  
+                simple_emb_cols = [col for col in hist_data.columns if col.endswith(('_log_freq', '_freq_rank'))]
                 
                 categorical_features = {}
                 if dummy_cols:
                     categorical_features.update(last_row[dummy_cols].to_dict())
-                if emb_cols:
-                    categorical_features.update(last_row[emb_cols].to_dict())
+                if simple_emb_cols:
+                    categorical_features.update(last_row[simple_emb_cols].to_dict())
                 categorical_cache[cache_key] = categorical_features
             
             # Usar features categóricas do cache
@@ -267,14 +267,14 @@ class Predictor:
         
         # Otimizar extração de features categóricas usando masks
         dummy_cols = [col for col in hist_data.columns if col.startswith(('categoria_', 'premise_'))]
-        emb_cols = [col for col in hist_data.columns if col.endswith(('_target_enc', '_emb_0', '_emb_1', '_emb_2', '_emb_3', '_emb_4', 
-                           '_emb_5', '_emb_6', '_emb_7', '_emb_8', '_emb_9'))]
+        # ATUALIZADO: usar apenas features simples sem vazamento
+        simple_emb_cols = [col for col in hist_data.columns if col.endswith(('_log_freq', '_freq_rank'))]
         
         categorical_features = {}
         if dummy_cols:
             categorical_features.update(last_row[dummy_cols].to_dict())
-        if emb_cols:
-            categorical_features.update(last_row[emb_cols].to_dict())
+        if simple_emb_cols:
+            categorical_features.update(last_row[simple_emb_cols].to_dict())
         
         # Pre-computar lag indices para otimização
         lag_indices = np.array([1, 2, 3, 4, 8, 12])

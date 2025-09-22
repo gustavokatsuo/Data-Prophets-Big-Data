@@ -301,21 +301,23 @@ class DataProcessor:
         for lag in LAG_FEATURES:
             self.df_agg[f'lag_{lag}'] = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty'].shift(lag)
         
-        # Features rolling
+        # Features rolling - CORRIGIDO PARA EVITAR VAZAMENTO
         print("  → Criando features rolling...")
         grouped = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty']
-        self.df_agg['rmean_4'] = grouped.shift(1).rolling(4, min_periods=1).mean()
-        print("    → Média móvel 4 criada")
+        # MUDANÇA: min_periods=4 para evitar vazamento de dados com poucos pontos
+        self.df_agg['rmean_4'] = grouped.shift(1).rolling(4, min_periods=4).mean()
+        print("    → Média móvel 4 criada (min_periods=4)")
         
-        self.df_agg['rstd_4'] = grouped.shift(1).rolling(4, min_periods=1).std()
-        print("    → Desvio padrão móvel 4 criado")
+        # MUDANÇA: min_periods=4 para consistência
+        self.df_agg['rstd_4'] = grouped.shift(1).rolling(4, min_periods=4).std()
+        print("    → Desvio padrão móvel 4 criado (min_periods=4)")
         
-        # Otimização para fração de não zeros
+        # Otimização para fração de não zeros - CORRIGIDO
         is_nonzero = (self.df_agg['qty'] > 0).astype('int8')
         self.df_agg['nonzero_frac_8'] = (
             is_nonzero.groupby([self.df_agg['pdv'], self.df_agg['internal_product_id']])
             .shift(1)
-            .rolling(8, min_periods=1)
+            .rolling(8, min_periods=8)  # MUDANÇA: min_periods=8
             .mean()
         )
         print("    → Fração de não zeros nas últimas 8 criada")
@@ -327,8 +329,13 @@ class DataProcessor:
         # Criar features categóricas
         self.create_categorical_features()
         
+        # REMOVIDO: create_unit_price_features() - pode causar vazamento
+        # As features de preço foram removidas para evitar data leakage
+        
         # Definir colunas de features básicas (removido 'gross' para evitar data leakage)
         base_features = ['week_of_year'] + lag_cols
+        
+        # NÃO adicionar features de preço
         self.feature_columns = base_features + self.categorical_features
         
         print(f"   → {len(lag_cols)} features de lag criadas")
@@ -348,10 +355,10 @@ class DataProcessor:
             print("   → Nenhuma coluna categórica encontrada nos dados agregados")
             return
         
-        # 1. Features Dummy (One-Hot Encoding)
+        # 1. Features Dummy (One-Hot Encoding) - SEM VAZAMENTO
         for col in available_dummy:
             print(f"  → Criando dummies para {col}...")
-            # Verificar valores únicos e criar dummies manualmente
+            # Usar apenas as top categorias mais frequentes (sem target info)
             unique_values = self.df_agg[col].value_counts().head(10).index.tolist()
             
             for value in unique_values:
@@ -361,71 +368,26 @@ class DataProcessor:
             
             print(f"    → {len(unique_values)} dummies criadas para {col}")
         
-        # 2. Features de Embedding (usando Autoencoders OTIMIZADOS)
+        # 2. Features de Embedding - REMOVENDO EMBEDDINGS SUPERVISIONADOS
         for col in available_embedding:
-            print(f"  → Criando embeddings para {col}...")
+            print(f"  → Criando features simples para {col} (sem vazamento)...")
             
-            # Frequência mínima para manter categorias
+            # Substituir embeddings complexos por features simples baseadas apenas em frequência
             value_counts = self.df_agg[col].value_counts()
-            valid_categories = value_counts[value_counts >= EMBEDDING_CONFIG['min_frequency']].index
             
-            # Substituir categorias raras por 'outros'
-            self.df_agg[f'{col}_processed'] = self.df_agg[col].apply(
-                lambda x: x if x in valid_categories else 'outros'
-            )
+            # Feature 1: Log da frequência da categoria (sem target)
+            freq_map = np.log1p(value_counts).to_dict()
+            self.df_agg[f'{col}_log_freq'] = self.df_agg[col].map(freq_map).fillna(0)
+            self.categorical_features.append(f'{col}_log_freq')
             
-            # Verificação de memória preventiva
-            n_unique = self.df_agg[f'{col}_processed'].nunique()
-            n_samples = len(self.df_agg)
-            estimated_memory_gb = self._estimate_memory_usage(n_unique, n_samples)
+            # Feature 2: Ranking da categoria por frequência (sem target)
+            rank_map = {v: i+1 for i, v in enumerate(value_counts.index)}
+            self.df_agg[f'{col}_freq_rank'] = self.df_agg[col].map(rank_map).fillna(value_counts.shape[0]+1)
+            self.categorical_features.append(f'{col}_freq_rank')
             
-            print(f"    → {n_unique} categorias, {n_samples:,} amostras")
-            print(f"    → Memória estimada: {estimated_memory_gb:.2f} GB")
-            
-            # Se há muitas categorias únicas, usar Autoencoders otimizados
-            if n_unique > EMBEDDING_CONFIG['max_unique_values']:
-                if estimated_memory_gb > 8.0:  # Limite de segurança
-                    print(f"    ⚠️ Memória estimada muito alta, usando target encoding como fallback")
-                    # Fallback para target encoding
-                    target_means = self.df_agg.groupby(f'{col}_processed')['qty'].mean()
-                    self.df_agg[f'{col}_target_enc'] = self.df_agg[f'{col}_processed'].map(target_means)
-                    self.categorical_features.append(f'{col}_target_enc')
-                    self.label_encoders[col] = target_means
-                else:
-                    print(f"    → Aplicando Autoencoders OTIMIZADOS...")
-                    
-                    # Criar embeddings usando Autoencoders otimizados
-                    embeddings, encoder, le = self._create_autoencoder_embeddings(
-                        self.df_agg[f'{col}_processed'], 
-                        self.df_agg['qty'],  # Target para embeddings supervisionados
-                        n_unique,
-                        EMBEDDING_CONFIG['n_components']
-                    )
-                    
-                    # Adicionar embeddings como features
-                    for i in range(embeddings.shape[1]):
-                        feature_name = f'{col}_ae_{i}'  # ae = autoencoder
-                        self.df_agg[feature_name] = embeddings[:, i]
-                        self.categorical_features.append(feature_name)
-                    
-                    # Salvar transformadores para predições futuras
-                    self.label_encoders[col] = le
-                    self.autoencoder_transformers[col] = encoder
-                    
-                    print(f"    → {embeddings.shape[1]} embeddings criados para {col} usando Autoencoders")
-            else:
-                # Para poucas categorias, usar target encoding simples
-                target_means = self.df_agg.groupby(f'{col}_processed')['qty'].mean()
-                self.df_agg[f'{col}_target_enc'] = self.df_agg[f'{col}_processed'].map(target_means)
-                self.categorical_features.append(f'{col}_target_enc')
-                
-                # Salvar encoder
-                self.label_encoders[col] = target_means
-                
-                print(f"    → Target encoding criado para {col}")
-                print(f"   → Total de {len(self.categorical_features)} features categóricas criadas")
-            # Remover coluna temporária
-            self.df_agg.drop(f'{col}_processed', axis=1, inplace=True)
+            print(f"    → 2 features simples criadas para {col} (log_freq + freq_rank)")
+        
+        print(f"   → Total de {len(self.categorical_features)} features categóricas criadas (SEM VAZAMENTO)")
     
     def _estimate_memory_usage(self, n_unique, n_samples):
         """
@@ -844,6 +806,140 @@ class DataProcessor:
                     embedding_matrix[i, j] = (hash_val % (j * 100 + 1)) / (j * 100 + 1)
         
         return embedding_matrix
+
+    def create_unit_price_features(self):
+        """
+        Cria features de preço unitário baseado no gross_value e quantity
+        Implementa previsão de preços futuros baseada na tendência histórica
+        """
+        print("💰 Criando features de preço unitário...")
+        
+        # Verificar se as colunas necessárias existem
+        if 'gross' not in self.df_agg.columns:
+            print("   → ⚠️ Coluna 'gross' não encontrada. Pulando criação de features de preço.")
+            return
+        
+        # Calcular preço unitário onde faz sentido (qty > 0 e gross > 0)
+        valid_mask = (self.df_agg['qty'] > 0) & (self.df_agg['gross'] > 0)
+        
+        # Inicializar coluna de preço unitário
+        self.df_agg['unit_price'] = 0.0
+        
+        # Calcular preço unitário e arredondar para 2 casas decimais
+        self.df_agg.loc[valid_mask, 'unit_price'] = (
+            self.df_agg.loc[valid_mask, 'gross'] / self.df_agg.loc[valid_mask, 'qty']
+        ).round(2)
+        
+        print(f"   → Preço unitário calculado para {valid_mask.sum():,} registros")
+        
+        # Criar features de lag do preço unitário
+        self.df_agg = self.df_agg.sort_values(['pdv', 'internal_product_id', 'week_of_year'])
+        
+        # Lags de preço unitário
+        price_lags = [1, 2, 4]
+        for lag in price_lags:
+            col_name = f'unit_price_lag_{lag}'
+            self.df_agg[col_name] = (
+                self.df_agg.groupby(['pdv', 'internal_product_id'])['unit_price']
+                .shift(lag)
+                .fillna(0)
+                .round(2)
+            )
+            print(f"   → Feature {col_name} criada")
+        
+        # Feature de variação de preço (diferença percentual)
+        self.df_agg['unit_price_change_pct'] = (
+            self.df_agg.groupby(['pdv', 'internal_product_id'])['unit_price']
+            .pct_change()
+            .fillna(0)
+            .round(4)
+        )
+        print("   → Feature unit_price_change_pct criada")
+        
+        # Feature de preço médio das últimas 4 semanas
+        self.df_agg['unit_price_rolling_mean_4'] = (
+            self.df_agg.groupby(['pdv', 'internal_product_id'])['unit_price']
+            .shift(1)
+            .rolling(4, min_periods=1)
+            .mean()
+            .fillna(0)
+            .round(2)
+        )
+        print("   → Feature unit_price_rolling_mean_4 criada")
+        
+        # Criar previsões de preço para dados futuros (janeiro 2023)
+        self._create_future_price_predictions()
+        
+        print(f"   → Features de preço unitário criadas com sucesso")
+    
+    def _create_future_price_predictions(self):
+        """
+        Cria previsões de preço unitário para dados futuros usando tendência histórica
+        """
+        print("   → Criando previsões de preço para dados futuros...")
+        
+        # Identificar combinações PDV-produto com dados históricos suficientes
+        price_evolution = self.df_agg[self.df_agg['unit_price'] > 0].copy()
+        
+        if len(price_evolution) == 0:
+            print("   → ⚠️ Nenhum dado de preço válido encontrado")
+            return
+        
+        # Agrupar por PDV-produto para calcular tendências
+        predicted_prices = []
+        
+        for (pdv, product_id), group in price_evolution.groupby(['pdv', 'internal_product_id']):
+            group_sorted = group.sort_values('week_of_year')
+            
+            if len(group_sorted) >= 2:
+                # Usar os últimos 6 registros ou todos disponíveis
+                recent_data = group_sorted.tail(6)
+                weeks = np.arange(len(recent_data))
+                prices = recent_data['unit_price'].values
+                
+                if len(prices) > 1 and np.any(prices > 0):
+                    # Calcular tendência linear
+                    slope, intercept = np.polyfit(weeks, prices, 1)
+                    last_price = prices[-1]
+                    
+                    # Prever preço para próximo período
+                    predicted_price = last_price + slope
+                    
+                    # Aplicar limites realistas
+                    min_price = last_price * 0.8  # Máx 20% redução
+                    max_price = last_price * 1.3  # Máx 30% aumento
+                    predicted_price = np.clip(predicted_price, min_price, max_price)
+                else:
+                    predicted_price = group_sorted['unit_price'].iloc[-1]
+            else:
+                predicted_price = group_sorted['unit_price'].iloc[-1]
+            
+            predicted_prices.append({
+                'pdv': pdv,
+                'internal_product_id': product_id,
+                'predicted_unit_price': round(predicted_price, 2)
+            })
+        
+        # Converter para DataFrame para merge
+        predicted_df = pd.DataFrame(predicted_prices)
+        
+        # Adicionar coluna de preço previsto ao dataset principal
+        self.df_agg = self.df_agg.merge(
+            predicted_df, 
+            on=['pdv', 'internal_product_id'], 
+            how='left'
+        )
+        
+        # Preencher valores ausentes com o último preço observado
+        self.df_agg['predicted_unit_price'] = self.df_agg['predicted_unit_price'].fillna(
+            self.df_agg['unit_price']
+        ).round(2)
+        
+        # Renomear para feature final
+        self.df_agg['unit_price_predicted'] = self.df_agg['predicted_unit_price']
+        self.df_agg = self.df_agg.drop(columns=['predicted_unit_price'], errors='ignore')
+        
+        print(f"   → Previsões de preço criadas para {len(predicted_df):,} combinações PDV-produto")
 
     def detect_and_treat_outliers(self, rolling_window=12, z_threshold=5.0, treatment='winsorize', 
                                   adaptive_threshold=True, min_observations=10, absolute_cap_multiplier=3,
@@ -1375,6 +1471,37 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
     # Preparar features e targets
     X_train, y_train = processor.prepare_features_target(train_data)
     X_val, y_val = processor.prepare_features_target(valid_data)
+    
+    # SALVAR DADOS PARA ANÁLISE ANTES DO TREINAMENTO
+    print("💾 Salvando dados de treinamento e validação para análise...")
+    
+    # Salvar dados de treinamento
+    train_sample = pd.concat([X_train, y_train], axis=1)
+    train_sample.to_csv('data_for_model_training.csv', index=False, encoding='utf-8')
+    print(f"   → Dados de treinamento salvos: {len(train_sample):,} registros")
+    print(f"   → Features: {len(X_train.columns)} colunas")
+    print(f"   → Arquivo: data_for_model_training.csv")
+    
+    # Salvar dados de validação
+    val_sample = pd.concat([X_val, y_val], axis=1)
+    val_sample.to_csv('data_for_model_validation.csv', index=False, encoding='utf-8')
+    print(f"   → Dados de validação salvos: {len(val_sample):,} registros")
+    print(f"   → Arquivo: data_for_model_validation.csv")
+    
+    # Salvar informações das features
+    feature_info = pd.DataFrame({
+        'feature_name': processor.feature_columns,
+        'feature_type': ['categorical' if col.startswith(('categoria_', 'premise_')) or col.endswith(('_target_enc', '_emb_0', '_emb_1', '_emb_2', '_emb_3', '_emb_4', '_emb_5', '_emb_6', '_emb_7', '_emb_8', '_emb_9')) else 'numerical' for col in processor.feature_columns]
+    })
+    feature_info.to_csv('model_features_info.csv', index=False, encoding='utf-8')
+    print(f"   → Informações das features salvas: model_features_info.csv")
+    
+    # Salvar estatísticas descritivas das features
+    features_stats = X_train.describe().T
+    features_stats['feature_name'] = features_stats.index
+    features_stats = features_stats[['feature_name', 'count', 'mean', 'std', 'min', '25%', '50%', '75%', 'max']]
+    features_stats.to_csv('model_features_statistics.csv', index=False, encoding='utf-8')
+    print(f"   → Estatísticas das features salvas: model_features_statistics.csv")
     
     # Estatísticas
     stats = processor.get_basic_stats()
