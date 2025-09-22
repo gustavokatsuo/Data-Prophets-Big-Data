@@ -5,7 +5,6 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error
 import pickle
 import os
-from scripts.utils import create_asymmetric_objective
 from .config import MODEL_PARAMS, TRAINING_PARAMS, PREDICTION_WEEKS
 from datetime import datetime
 import warnings
@@ -13,6 +12,11 @@ import multiprocessing as mp
 from tqdm import tqdm
 from functools import partial
 import traceback # Importar para depuração
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
 
@@ -52,49 +56,235 @@ def _predict_batch_optimized(batch_data, model, feature_columns, weeks):
         print(f"--- ERRO em batch: {e} ---")
         return []
 
+def _calculate_all_features_for_prediction(qty_values, week, categorical_features, feature_columns):
+    """
+    VERSÃO VETORIZADA - Calcula TODAS as features de forma super otimizada
+    Esta função garante que as mesmas features usadas no treino sejam usadas na predição
+    """
+    features_dict = {'week_of_year': week}
+    n_qty = len(qty_values)
+    
+    if n_qty == 0:
+        # Se não há dados, retornar features zeradas + categóricas
+        for col in feature_columns:
+            if col not in categorical_features and col != 'week_of_year':
+                features_dict[col] = 0
+        features_dict.update(categorical_features)
+        return features_dict
+    
+    # Converter para numpy array uma única vez para performance
+    qty_array = np.asarray(qty_values, dtype=np.float32)
+    
+    # 🚀 PRÉ-COMPUTAR TUDO DE UMA VEZ
+    # Criar dicionário para armazenar rolling features calculadas apenas uma vez
+    rolling_cache = {}
+    
+    # 1️⃣ LAGS VETORIZADOS - calcular todos os lags de uma vez
+    lag_features = ['lag_1', 'lag_2', 'lag_3', 'lag_4', 'lag_5', 'lag_6', 'lag_7', 'lag_8', 'lag_12', 'lag_16', 'lag_24']
+    lag_indices = [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24]
+    
+    # Calcular apenas os lags que existem no modelo
+    needed_lags = [i for i, lag_name in enumerate(lag_features) if lag_name in feature_columns]
+    if needed_lags:
+        lag_values = np.zeros(len(lag_indices), dtype=np.float32)
+        valid_indices = [i for i in needed_lags if lag_indices[i] <= n_qty]
+        if valid_indices:
+            lag_positions = [-lag_indices[i] for i in valid_indices]
+            lag_values[valid_indices] = qty_array[lag_positions]
+        
+        for i, lag_name in enumerate(lag_features):
+            if lag_name in feature_columns:
+                features_dict[lag_name] = float(lag_values[i])
+    
+    # 2️⃣ ROLLING FEATURES VETORIZADAS - calcular todas as janelas de uma vez
+    windows = [4, 8, 12, 16, 20]
+    rolling_types = ['rmean', 'rstd', 'rmax', 'rmin', 'rrange', 'rskew', 'rcv']
+    
+    # Identificar quais windows são necessárias
+    needed_windows = []
+    needed_types = set()
+    for window in windows:
+        window_needed = False
+        for rtype in rolling_types:
+            if f'{rtype}_{window}' in feature_columns:
+                needed_types.add(rtype)
+                window_needed = True
+        if window_needed:
+            needed_windows.append(window)
+    
+    # Calcular rolling features apenas para windows necessárias
+    for window in needed_windows:
+        if n_qty >= window:
+            window_data = qty_array[-window:]
+        else:
+            window_data = qty_array
+        
+        # Calcular todas as estatísticas de uma vez
+        if len(window_data) > 0:
+            if 'rmean' in needed_types:
+                rolling_cache[f'rmean_{window}'] = float(np.mean(window_data))
+            if 'rstd' in needed_types:
+                rolling_cache[f'rstd_{window}'] = float(np.std(window_data)) if len(window_data) > 1 else 0.0
+            if 'rmax' in needed_types:
+                rolling_cache[f'rmax_{window}'] = float(np.max(window_data))
+            if 'rmin' in needed_types:
+                rolling_cache[f'rmin_{window}'] = float(np.min(window_data))
+            if 'rrange' in needed_types:
+                rolling_cache[f'rrange_{window}'] = float(np.max(window_data) - np.min(window_data)) if len(window_data) > 1 else 0.0
+            if 'rskew' in needed_types and SCIPY_AVAILABLE and len(window_data) >= 3:
+                try:
+                    rolling_cache[f'rskew_{window}'] = float(stats.skew(window_data))
+                except:
+                    rolling_cache[f'rskew_{window}'] = 0.0
+            elif 'rskew' in needed_types:
+                rolling_cache[f'rskew_{window}'] = 0.0
+        else:
+            # Valores padrão quando não há dados
+            for rtype in needed_types:
+                rolling_cache[f'{rtype}_{window}'] = 0.0
+    
+    # Adicionar features rolling calculadas ao resultado
+    for window in windows:
+        for rtype in rolling_types:
+            col_name = f'{rtype}_{window}'
+            if col_name in feature_columns:
+                features_dict[col_name] = rolling_cache.get(col_name, 0.0)
+    
+    # Calcular rcv baseado em rmean e rstd já calculados
+    for window in windows:
+        rcv_col = f'rcv_{window}'
+        if rcv_col in feature_columns:
+            mean_val = rolling_cache.get(f'rmean_{window}', 0.0)
+            std_val = rolling_cache.get(f'rstd_{window}', 0.0)
+            features_dict[rcv_col] = std_val / (mean_val + 0.01)
+    
+    # 3️⃣ VARIAÇÕES PERCENTUAIS VETORIZADAS
+    pct_lags = [1, 2, 4, 8]
+    if n_qty >= 1:
+        current_val = qty_array[-1]
+        for lag in pct_lags:
+            col_name = f'pct_change_{lag}'
+            if col_name in feature_columns:
+                if lag <= n_qty:
+                    past_val = qty_array[-lag]
+                    denominator = max(abs(past_val), 0.01)
+                    features_dict[col_name] = float((current_val - past_val) / denominator)
+                else:
+                    features_dict[col_name] = 0.0
+    else:
+        for lag in pct_lags:
+            col_name = f'pct_change_{lag}'
+            if col_name in feature_columns:
+                features_dict[col_name] = 0.0
+    
+    # 4️⃣ FEATURES DE SAZONALIDADE OTIMIZADAS
+    if isinstance(week, pd.Timestamp):
+        month = week.month
+        quarter = week.quarter
+        week_of_month = min(((week - week.replace(day=1)).days // 7) + 1, 5)
+        is_end_month = int((week.replace(day=1) + pd.DateOffset(months=1) - week).days <= 7)
+        is_start_month = int(week.day <= 7)
+        is_end_quarter = int(week.month in [3, 6, 9, 12])
+        is_start_quarter = int(week.month in [1, 4, 7, 10])
+        is_holiday = int(week.month in [12, 1])
+    else:
+        # Aproximações numéricas mais eficientes
+        month_approx = ((week - 1) // 4.33) % 12 + 1
+        month = int(np.clip(month_approx, 1, 12))
+        quarter = int(((month - 1) // 3) + 1)
+        week_of_month = int(((week - 1) % 4.33) + 1)
+        week_in_month = (week - 1) % 4.33
+        week_in_quarter = (week - 1) % 13
+        is_end_month = int(week_in_month >= 3.5)
+        is_start_month = int(week_in_month <= 0.5)
+        is_end_quarter = int(week_in_quarter >= 11)
+        is_start_quarter = int(week_in_quarter <= 1)
+        is_holiday = int(week >= 48)
+    
+    # Mapear features de sazonalidade
+    seasonality_map = {
+        'month': month,
+        'quarter': quarter,
+        'week_of_month': week_of_month,
+        'month_sin': np.sin(2 * np.pi * month / 12),
+        'month_cos': np.cos(2 * np.pi * month / 12),
+        'quarter_sin': np.sin(2 * np.pi * quarter / 4),
+        'quarter_cos': np.cos(2 * np.pi * quarter / 4),
+        'is_end_of_month': is_end_month,
+        'is_start_of_month': is_start_month,
+        'is_end_of_quarter': is_end_quarter,
+        'is_start_of_quarter': is_start_quarter,
+        'is_holiday_season': is_holiday
+    }
+    
+    for col, value in seasonality_map.items():
+        if col in feature_columns:
+            features_dict[col] = float(value)
+    
+    # 7️⃣ FEATURES DE TENDÊNCIA VETORIZADAS
+    trend_windows = [4, 8, 12]
+    for window in trend_windows:
+        col_name = f'trend_{window}'
+        if col_name in feature_columns:
+            if n_qty >= window:
+                window_data = qty_array[-window:]
+                X = np.arange(len(window_data), dtype=np.float32)
+                var_x = np.var(X)
+                if var_x > 0:
+                    slope = np.cov(X, window_data)[0, 1] / var_x
+                    features_dict[col_name] = float(slope)
+                else:
+                    features_dict[col_name] = 0.0
+            else:
+                features_dict[col_name] = 0.0
+    
+    # 8️⃣ FEATURES DE ACELERAÇÃO (baseadas em tendências já calculadas)
+    accel_map = {
+        'accel_4_8': ('trend_4', 'trend_8'),
+        'accel_8_12': ('trend_8', 'trend_12')
+    }
+    for accel_col, (trend1, trend2) in accel_map.items():
+        if accel_col in feature_columns:
+            val1 = features_dict.get(trend1, 0.0)
+            val2 = features_dict.get(trend2, 0.0)
+            features_dict[accel_col] = val1 - val2
+    
+    # 9️⃣ FEATURES DE MOMENTUM (baseadas em médias já calculadas)
+    momentum_map = {
+        'momentum_4_8': ('rmean_4', 'rmean_8'),
+        'momentum_8_12': ('rmean_8', 'rmean_12'),
+        'momentum_4_12': ('rmean_4', 'rmean_12')
+    }
+    for momentum_col, (short_mean, long_mean) in momentum_map.items():
+        if momentum_col in feature_columns:
+            short_val = features_dict.get(short_mean, 0.0)
+            long_val = features_dict.get(long_mean, 0.0)
+            features_dict[momentum_col] = short_val / (long_val + 0.01)
+    
+    # 🔟 NONZERO FRACTION
+    if 'nonzero_frac_8' in feature_columns:
+        if n_qty >= 8:
+            nonzero_data = qty_array[-8:]
+        else:
+            nonzero_data = qty_array
+        features_dict['nonzero_frac_8'] = float(np.mean(nonzero_data > 0)) if len(nonzero_data) > 0 else 0.0
+    
+    # 🔗 FEATURES CATEGÓRICAS (adicionar por último)
+    features_dict.update(categorical_features)
+    
+    return features_dict
+
 def _predict_single_fast(pdv, sku, hist_data, model, feature_columns, weeks, categorical_features):
     """Versão ultra-rápida de predição com features categóricas em cache"""
     try:
         predictions = []
         qty_values = hist_data['qty'].values
         
-        # Pre-computar valores constantes
-        lag_indices = np.array([1, 2, 3, 4, 8, 12])
-        
         for week in weeks:
-            # Preparar features base de forma vetorizada
-            features_dict = {'week_of_year': week}
-            
-            # Lags vetorizados
-            n_qty = len(qty_values)
-            lag_values = np.zeros(6)  # Para os 6 lags
-            valid_mask = lag_indices <= n_qty
-            if np.any(valid_mask):
-                lag_values[valid_mask] = qty_values[-lag_indices[valid_mask]]
-            
-            # Adicionar lags ao dict
-            for i, lag in enumerate([1, 2, 3, 4, 8, 12]):
-                features_dict[f'lag_{lag}'] = lag_values[i]
-            
-            # Rolling features otimizadas
-            # Exclusão da semana mais recente para evitar predições esponenciais (lag_1)
-            if len(qty_values) >= 4:
-                window = qty_values[-4:] # Usar os 4 valores mais recentes
-                features_dict['rmean_4'] = np.mean(window)
-                features_dict['rstd_4'] = np.std(window)
-            else:
-                features_dict['rmean_4'] = np.mean(qty_values) if len(qty_values) > 0 else 0
-                features_dict['rstd_4'] = np.std(qty_values) if len(qty_values) > 1 else 0
-
-            # Nonzero fraction
-            if len(qty_values) >= 8:
-                nonzero_values = qty_values[-8:]
-            else:
-                nonzero_values = qty_values
-            features_dict['nonzero_frac_8'] = np.mean(nonzero_values > 0) if len(nonzero_values) > 0 else 0
-                        
-            # Adicionar features categóricas do cache
-            features_dict.update(categorical_features)
+            # USAR A NOVA FUNÇÃO QUE CALCULA TODAS AS FEATURES
+            features_dict = _calculate_all_features_for_prediction(
+                qty_values, week, categorical_features, feature_columns
+            )
             
             # Criar array de features na ordem correta
             feature_array = np.zeros(len(feature_columns))
@@ -138,28 +328,35 @@ class LightGBMModel:
         self.best_iteration = None
         
     def train(self, X_train, y_train, X_val=None, y_val=None):
-        """Treina o modelo LightGBM com transformação logarítmica"""
-        print("🤖 Treinando modelo LightGBM com transformação logarítmica...")
+        """Treina o modelo LightGBM na escala original"""
+        print("🤖 Treinando modelo LightGBM...")
         
-        # Aplicar transformação logarítmica nos targets
-        y_train_log = np.log1p(y_train)
-        print(f"   → Target transformado - Original: [{y_train.min():.2f}, {y_train.max():.2f}] → Log: [{y_train_log.min():.4f}, {y_train_log.max():.4f}]")
+        print(f"   → Target range - Original: [{y_train.min():.2f}, {y_train.max():.2f}]")
         
-        # Datasets do LightGBM
-        dtrain = lgb.Dataset(X_train, label=y_train_log)
+        # Datasets do LightGBM (sem transformação logarítmica)
+        dtrain = lgb.Dataset(X_train, label=y_train)
         valid_sets = [dtrain]
         valid_names = ['training']
         
-        y_val_log = None
         if X_val is not None and y_val is not None:
-            y_val_log = np.log1p(y_val)
-            dval = lgb.Dataset(X_val, label=y_val_log)
+            dval = lgb.Dataset(X_val, label=y_val)
             valid_sets.append(dval)
             valid_names.append('valid_1')
-            print(f"   → Target validação transformado - Original: [{y_val.min():.2f}, {y_val.max():.2f}] → Log: [{y_val_log.min():.4f}, {y_val_log.max():.4f}]")
+            print(f"   → Target validação range: [{y_val.min():.2f}, {y_val.max():.2f}]")
 
-        asymmetric_objective = create_asymmetric_objective(penalty_weight=1.5)
-        self.model_params['objective'] = asymmetric_objective
+        # Usar configuração padrão do LightGBM sem função objetivo personalizada
+        # Remover função objetivo personalizada para evitar problemas de serialização
+        if 'objective' in self.model_params and callable(self.model_params['objective']):
+            self.model_params = self.model_params.copy()
+            self.model_params['objective'] = 'regression'  # Usar regressão padrão
+            
+        # Usar métrica WMAPE customizada
+        def feval_wmape(y_pred, dtrain):
+            y_true = dtrain.get_label()
+            # Calcular WMAPE na escala original
+            wmape = np.sum(np.abs(y_pred - y_true)) / np.sum(np.abs(y_true))
+            # Retornar (nome_da_métrica, valor, is_higher_better)
+            return ("wmape", wmape, False)
 
         # Treinar modelo
         self.model = lgb.train(
@@ -167,6 +364,7 @@ class LightGBMModel:
             dtrain,
             valid_sets=valid_sets,
             valid_names=valid_names,
+            feval=feval_wmape,
             num_boost_round=self.training_params['num_boost_round'],
             callbacks=[
                 lgb.early_stopping(self.training_params['early_stopping_rounds']),
@@ -179,51 +377,43 @@ class LightGBMModel:
         
         # Calcular WMAPE de validação se disponível
         if X_val is not None and y_val is not None:
-            # Fazer predições na escala logarítmica e reverter para escala original
-            pred_val_log = self.predict_log(X_val)
-            pred_val = np.expm1(pred_val_log)
+            # Fazer predições na escala original
+            pred_val = self.predict(X_val)
             
             # Calcular WMAPE na escala original
             wmape = np.sum(np.abs(pred_val - y_val)) / np.sum(np.abs(y_val))
-            print(f'📊 WMAPE validação (escala original): {wmape:.4f}')
+            print(f'📊 WMAPE validação: {wmape:.4f}')
             
-            # Calcular MAE na escala logarítmica para comparação
-            mae_log = np.mean(np.abs(pred_val_log - y_val_log))
-            print(f'📊 MAE validação (escala log): {mae_log:.4f}')
+            # Calcular MAE para comparação
+            mae = np.mean(np.abs(pred_val - y_val))
+            print(f'📊 MAE validação: {mae:.4f}')
             
             return wmape
         
         return None
     
-    def predict_log(self, X):
-        """Faz predições na escala logarítmica (sem transformação inversa)"""
+    def predict(self, X):
+        """Faz predições com o modelo treinado na escala original"""
         if self.model is None:
             raise ValueError("Modelo não foi treinado. Execute train() primeiro.")
         
+        # Fazer predição diretamente na escala original
         if self.best_iteration is None:
-            return self.model.predict(X)
-
-        # Use num_iteration instead of iteration (deprecated in newer LightGBM versions)
-        try:
-            return self.model.predict(X, num_iteration=self.best_iteration)
-        except (TypeError, ValueError):
+            pred = self.model.predict(X)
+        else:
+            # Use num_iteration instead of iteration (deprecated in newer LightGBM versions)
             try:
-                return self.model.predict(X, iteration=self.best_iteration)
-            except:
-                return self.model.predict(X)
-    
-    def predict(self, X):
-        """Faz predições com o modelo treinado e aplica transformação inversa"""
-        # Fazer predição na escala logarítmica
-        pred_log = self.predict_log(X)
+                pred = self.model.predict(X, num_iteration=self.best_iteration)
+            except (TypeError, ValueError):
+                try:
+                    pred = self.model.predict(X, iteration=self.best_iteration)
+                except:
+                    pred = self.model.predict(X)
         
-        # Aplicar transformação inversa para retornar à escala original
-        pred_original = np.expm1(pred_log)
+        # Garantir que não há valores negativos
+        pred = np.maximum(pred, 0)
         
-        # Garantir que não há valores negativos (devido a imprecisões numéricas)
-        pred_original = np.maximum(pred_original, 0)
-        
-        return pred_original
+        return pred
     
     def get_feature_importance(self, importance_type='gain', max_features=None):
         """Retorna feature importance"""
@@ -317,41 +507,13 @@ class Predictor:
         lag_indices = np.array([1, 2, 3, 4, 8, 12])
         
         for week in weeks:
-            feat = {'week_of_year': week}
-            
-            # Features de lag otimizadas com numpy indexing
-            n_lags = len(lags)
-            lag_values = np.zeros(len(lag_indices))
-            valid_lags = lag_indices <= n_lags
-            if np.any(valid_lags):
-                valid_indices = lag_indices[valid_lags]
-                lag_values[valid_lags] = lags[-valid_indices]
-            
-            # Adicionar lags ao dict de features
-            for i, lag in enumerate([1, 2, 3, 4, 8, 12]):
-                feat[f'lag_{lag}'] = lag_values[i]
-            
-            # Features rolling otimizadas
-            if n_lags >= 4:
-                recent_values = lags[-4:]
-                feat['rmean_4'] = np.mean(recent_values)
-                feat['rstd_4'] = np.std(recent_values)
-            else:
-                feat['rmean_4'] = np.mean(lags) if n_lags > 0 else 0
-                feat['rstd_4'] = np.std(lags) if n_lags > 1 else 0
-            
-            # Nonzero fraction otimizada
-            if n_lags >= 8:
-                nonzero_values = lags[-8:]
-            else:
-                nonzero_values = lags
-            feat['nonzero_frac_8'] = np.mean(nonzero_values > 0) if len(nonzero_values) > 0 else 0
-            
-            # Adicionar features categóricas
-            feat.update(categorical_features)
+            # USAR A NOVA FUNÇÃO QUE CALCULA TODAS AS FEATURES
+            features_dict = _calculate_all_features_for_prediction(
+                lags, week, categorical_features, self.feature_columns
+            )
             
             # Criar DataFrame e selecionar apenas as features que o modelo conhece
-            X_row = pd.DataFrame([feat])
+            X_row = pd.DataFrame([features_dict])
             
             # Garantir que todas as features do modelo estão presentes
             for col in self.feature_columns:
@@ -425,11 +587,11 @@ class Predictor:
             if hist_tuple is not None:
                 hist, hist_opt = hist_tuple
                 # Usar critério otimizado para histórico
-                if len(hist_opt['qty']) >= 3:
+                if len(hist_opt['qty']) >= 8:
                     valid_tasks.append((pdv, sku, hist))  # Manter formato original para compatibilidade
-        
-        print(f"   → {len(valid_tasks):,} combinações válidas (com histórico >= 3 semanas) para predição")
-        
+
+        print(f"   → {len(valid_tasks):,} combinações válidas (com histórico >= 8 semanas) para predição")
+
         if len(valid_tasks) == 0:
             print("   → ⚠️ Nenhuma combinação atendeu aos critérios de histórico mínimo. Retornando DataFrame vazio.")
             return pd.DataFrame() # Retorna DF vazio para evitar o erro `KeyError`

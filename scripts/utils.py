@@ -7,46 +7,32 @@ import json
 
 def create_asymmetric_objective(penalty_weight=1.5):
     """
-    Função fábrica que cria e retorna uma função de objetivo para o LightGBM.
-    
-    Esta função de objetivo penaliza mais os erros quando o valor real (y_true) é 0.
-
-    Args:
-        penalty_weight (float): Fator pelo qual a penalidade será multiplicada
-                                quando y_true == 0. Valores > 1.0 aumentam a penalidade.
-
-    Returns:
-        function: A função de objetivo (gradiente e hessiano) para ser usada no lgb.train.
+    Cria função de objetivo customizada para LightGBM
+    Penaliza mais erros quando o valor real é 0.
     """
-    
-    def asymmetric_logcosh_objective(y_true, y_pred):
-        # Garante que y_true seja um array numpy para compatibilidade
-        y_true = np.asarray(y_true)
-        
+
+    def asymmetric_logcosh_objective(y_pred, dataset):
+        # Obtém os valores verdadeiros do dataset
+        y_true = dataset.get_label()
+
         # 1. Calcula o erro residual
         residual = y_pred - y_true
-        
-        # 2. Calcula o gradiente (primeira derivada da perda Log-Cosh)
-        # O gradiente indica a direção e a magnitude do erro.
+
+        # 2. Gradiente (derivada primeira)
         grad = np.tanh(residual)
-        
-        # 3. Calcula o hessiano (segunda derivada da perda Log-Cosh)
-        # O hessiano ajusta o tamanho do passo do gradiente.
+
+        # 3. Hessiano (derivada segunda)
         hess = 1.0 - np.square(grad)
-        
-        # 4. Aplica a penalidade assimétrica
-        # Cria uma máscara booleana para encontrar todos os pontos onde y_true é 0.
+
+        # 4. Aplica penalidade assimétrica
         is_true_zero = (y_true == 0)
-        
-        # Multiplica o gradiente e o hessiano pelo fator de penalidade nesses pontos.
-        # Isso faz com que o modelo se esforce mais para corrigir erros nesses casos.
         grad[is_true_zero] *= penalty_weight
         hess[is_true_zero] *= penalty_weight
-        
+
         return grad, hess
 
-    # Retorna a função interna, pronta para ser usada pelo LightGBM
     return asymmetric_logcosh_objective
+
 
 def ensure_directories_exist(directories):
     """Garante que os diretórios existam"""

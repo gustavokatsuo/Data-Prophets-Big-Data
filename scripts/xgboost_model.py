@@ -12,6 +12,8 @@ import multiprocessing as mp
 from tqdm import tqdm
 from functools import partial
 import traceback
+# Importar a função de features do model.py
+from .model import _calculate_all_features_for_prediction
 
 warnings.filterwarnings('ignore')
 
@@ -182,38 +184,11 @@ def _predict_single_fast_xgb(pdv, sku, hist_data, model, feature_columns, cleane
         predictions = []
         qty_values = hist_data['qty'].values
         
-        lag_indices = np.array([1, 2, 3, 4, 8, 12])
-        
         for week in weeks:
-            features_dict = {'week_of_year': week}
-            
-            # Lags vetorizados
-            n_qty = len(qty_values)
-            lag_values = np.zeros(6)
-            valid_mask = lag_indices <= n_qty
-            if np.any(valid_mask):
-                lag_values[valid_mask] = qty_values[-lag_indices[valid_mask]]
-            
-            for i, lag in enumerate([1, 2, 3, 4, 8, 12]):
-                features_dict[f'lag_{lag}'] = lag_values[i]
-            
-            # Rolling features com correção de data leakage
-            if n_qty >= 4:
-                window = qty_values[-4:]
-                features_dict['rmean_4'] = np.mean(window)
-                features_dict['rstd_4'] = np.std(window)
-            else:
-                features_dict['rmean_4'] = np.mean(qty_values) if n_qty > 0 else 0
-                features_dict['rstd_4'] = np.std(qty_values) if n_qty > 1 else 0
-
-            # Nonzero fraction
-            if n_qty >= 8:
-                nonzero_values = qty_values[-8:]
-            else:
-                nonzero_values = qty_values
-            features_dict['nonzero_frac_8'] = np.mean(nonzero_values > 0) if len(nonzero_values) > 0 else 0
-            
-            features_dict.update(categorical_features)
+            # USAR A NOVA FUNÇÃO QUE CALCULA TODAS AS FEATURES
+            features_dict = _calculate_all_features_for_prediction(
+                qty_values, week, categorical_features, feature_columns
+            )
             
             # Criar DataFrame para XGBoost com uma linha
             X_row = pd.DataFrame([features_dict])

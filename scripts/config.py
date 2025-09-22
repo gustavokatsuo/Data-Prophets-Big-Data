@@ -18,8 +18,8 @@ MODEL_PARAMS = {
     'learning_rate': 0.02,
     'num_leaves': 32,
     'min_data_in_leaf': 50,
-    'reg_alpha': 0.1,
-    'reg_lambda': 0.1,
+    'reg_alpha': 0.4,
+    'reg_lambda': 0.4,
     'verbose': -1, 
     'seed': 42,
     'num_threads': -1

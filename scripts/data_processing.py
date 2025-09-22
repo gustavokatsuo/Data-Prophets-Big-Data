@@ -293,19 +293,19 @@ class DataProcessor:
         print(f"   → Semana {missing_week} interpolada: {len(interpolated_final):,} registros adicionados")
     
     def create_lag_features(self):
-        """Cria features de lag e rolling de forma vetorizada"""
-        print("⚡ Criando features com operações vetorizadas...")
+        """Cria features de lag e rolling de forma vetorizada (versão básica)"""
+        print("⚡ Criando features básicas com operações vetorizadas...")
         
         # Ordenar dados
         self.df_agg = self.df_agg.sort_values(['pdv', 'internal_product_id', 'week_of_year'])
         
-        # Criar lags
-        print("  → Criando lags...")
+        # Criar lags básicos
+        print("  → Criando lags básicos...")
         for lag in LAG_FEATURES:
             self.df_agg[f'lag_{lag}'] = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty'].shift(lag)
         
-        # Features rolling
-        print("  → Criando features rolling...")
+        # Features rolling básicas
+        print("  → Criando features rolling básicas...")
         grouped = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty']
 
         self.df_agg['rmean_4'] = grouped.shift(1).rolling(4, min_periods=4).mean()
@@ -339,6 +339,304 @@ class DataProcessor:
         
         print(f"   → {len(lag_cols)} features de lag criadas")
         print(f"   → Total de features: {len(self.feature_columns)}")
+        return self.df_agg
+    
+    def create_advanced_features(self):
+        """Cria features avançadas para melhorar performance do modelo"""
+        print("🚀 Criando features avançadas...")
+        
+        # Garantir que dados estão ordenados
+        self.df_agg = self.df_agg.sort_values(['pdv', 'internal_product_id', 'week_of_year'])
+        
+        # 1️⃣ LAGS ADICIONAIS
+        print("  → Criando lags adicionais...")
+        additional_lags = [5, 6, 7, 16, 24]
+        grouped_qty = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty']
+        
+        for lag in additional_lags:
+            self.df_agg[f'lag_{lag}'] = grouped_qty.shift(lag)
+            
+        print(f"    → {len(additional_lags)} lags adicionais criados")
+        
+        # 2️⃣ ROLLING FEATURES EXPANDIDAS
+        print("  → Criando rolling features expandidas...")
+        rolling_windows = [8, 12, 16, 20]
+        rolling_features = []
+        
+        for window in rolling_windows:
+            # Média e desvio padrão
+            self.df_agg[f'rmean_{window}'] = grouped_qty.shift(1).rolling(window, min_periods=min(4, window)).mean()
+            self.df_agg[f'rstd_{window}'] = grouped_qty.shift(1).rolling(window, min_periods=min(4, window)).std()
+            
+            # Valores extremos
+            self.df_agg[f'rmax_{window}'] = grouped_qty.shift(1).rolling(window, min_periods=min(4, window)).max()
+            self.df_agg[f'rmin_{window}'] = grouped_qty.shift(1).rolling(window, min_periods=min(4, window)).min()
+            
+            # Range (diferença entre max e min)
+            self.df_agg[f'rrange_{window}'] = self.df_agg[f'rmax_{window}'] - self.df_agg[f'rmin_{window}']
+            
+            rolling_features.extend([f'rmean_{window}', f'rstd_{window}', f'rmax_{window}', f'rmin_{window}', f'rrange_{window}'])
+            
+        print(f"    → {len(rolling_features)} rolling features criadas")
+        
+        # 3️⃣ VARIAÇÕES PERCENTUAIS (evitando divisão por zero)
+        print("  → Criando variações percentuais...")
+        pct_lags = [1, 2, 4, 8]
+        pct_features = []
+        
+        for lag in pct_lags:
+            lag_col = f'lag_{lag}'
+            if lag_col in self.df_agg.columns:
+                # Evitar divisão por zero usando máximo entre valor e uma pequena constante
+                denominator = np.maximum(self.df_agg[lag_col].abs(), 0.01)
+                self.df_agg[f'pct_change_{lag}'] = (self.df_agg['lag_1'] - self.df_agg[lag_col]) / denominator
+                pct_features.append(f'pct_change_{lag}')
+                
+        print(f"    → {len(pct_features)} variações percentuais criadas")
+        
+        # 4️⃣ FEATURES DE SAZONALIDADE
+        print("  → Criando features de sazonalidade...")
+        seasonal_features = []
+        
+        # Assumindo que week_of_year é sequencial a partir da primeira semana
+        # Mês aproximado (4.33 semanas por mês em média)
+        self.df_agg['month'] = ((self.df_agg['week_of_year'] - 1) // 4.33).astype(int) + 1
+        self.df_agg['month'] = np.clip(self.df_agg['month'], 1, 12)
+        
+        # Trimestre
+        self.df_agg['quarter'] = ((self.df_agg['month'] - 1) // 3) + 1
+        
+        # Semana do mês (1-4)
+        self.df_agg['week_of_month'] = ((self.df_agg['week_of_year'] - 1) % 4.33).astype(int) + 1
+        self.df_agg['week_of_month'] = np.clip(self.df_agg['week_of_month'], 1, 4)
+        
+        # Features cíclicas para capturar natureza circular das estações
+        self.df_agg['month_sin'] = np.sin(2 * np.pi * self.df_agg['month'] / 12)
+        self.df_agg['month_cos'] = np.cos(2 * np.pi * self.df_agg['month'] / 12)
+        self.df_agg['quarter_sin'] = np.sin(2 * np.pi * self.df_agg['quarter'] / 4)
+        self.df_agg['quarter_cos'] = np.cos(2 * np.pi * self.df_agg['quarter'] / 4)
+        
+        seasonal_features = ['month', 'quarter', 'week_of_month', 'month_sin', 'month_cos', 'quarter_sin', 'quarter_cos']
+        print(f"    → {len(seasonal_features)} features de sazonalidade criadas")
+        
+        # 5️⃣ FEATURES DE DISTRIBUIÇÃO ROLLING
+        print("  → Criando features de distribuição...")
+        distribution_features = []
+        
+        for window in [4, 8, 12]:
+            if window <= 12:  # Evitar janelas muito grandes para evitar overfitting
+                # Assimetria (skewness)
+                self.df_agg[f'rskew_{window}'] = grouped_qty.shift(1).rolling(window, min_periods=min(4, window)).skew()
+                
+                # Coeficiente de variação
+                mean_col = f'rmean_{window}' if f'rmean_{window}' in self.df_agg.columns else None
+                std_col = f'rstd_{window}' if f'rstd_{window}' in self.df_agg.columns else None
+                
+                if mean_col and std_col:
+                    self.df_agg[f'rcv_{window}'] = self.df_agg[std_col] / (self.df_agg[mean_col] + 0.01)
+                    distribution_features.append(f'rcv_{window}')
+                
+                distribution_features.append(f'rskew_{window}')
+                
+        print(f"    → {len(distribution_features)} features de distribuição criadas")
+        
+        # 6️⃣ FLAGS DE EVENTOS/PERÍODOS ESPECIAIS
+        print("  → Criando flags de eventos...")
+        event_features = []
+        
+        # Final e início de mês (baseado em semanas)
+        week_in_month = (self.df_agg['week_of_year'] - 1) % 4.33
+        self.df_agg['is_end_of_month'] = (week_in_month >= 3.5).astype(int)
+        self.df_agg['is_start_of_month'] = (week_in_month <= 0.5).astype(int)
+        
+        # Final e início de trimestre
+        week_in_quarter = (self.df_agg['week_of_year'] - 1) % 13
+        self.df_agg['is_end_of_quarter'] = (week_in_quarter >= 11).astype(int)
+        self.df_agg['is_start_of_quarter'] = (week_in_quarter <= 1).astype(int)
+        
+        # Período de férias/feriados (aproximado - últimas semanas do ano)
+        total_weeks = self.df_agg['week_of_year'].max()
+        self.df_agg['is_holiday_season'] = (self.df_agg['week_of_year'] >= total_weeks - 4).astype(int)
+        
+        event_features = ['is_end_of_month', 'is_start_of_month', 'is_end_of_quarter', 
+                         'is_start_of_quarter', 'is_holiday_season']
+        print(f"    → {len(event_features)} flags de eventos criadas")
+        
+        # 7️⃣ FEATURES DE TENDÊNCIA
+        print("  → Criando features de tendência...")
+        trend_features = []
+        
+        # Tendência linear nas últimas N semanas
+        for window in [4, 8, 12]:
+            # Calcular slope (tendência) usando regressão linear simples
+            def rolling_slope(series, window):
+                def calc_slope(x):
+                    if len(x) < 3:
+                        return 0
+                    y = np.array(x)
+                    X = np.arange(len(y))
+                    if np.var(X) == 0:
+                        return 0
+                    slope = np.cov(X, y)[0, 1] / np.var(X)
+                    return slope
+                
+                return series.rolling(window, min_periods=3).apply(calc_slope, raw=False)
+            
+            self.df_agg[f'trend_{window}'] = grouped_qty.shift(1).apply(lambda x: rolling_slope(x, window))
+            trend_features.append(f'trend_{window}')
+            
+        print(f"    → {len(trend_features)} features de tendência criadas")
+        
+        # 8️⃣ FEATURES DE ACELERAÇÃO (diferença entre tendências)
+        print("  → Criando features de aceleração...")
+        accel_features = []
+        
+        # Aceleração como diferença entre tendências de períodos diferentes
+        if 'trend_4' in self.df_agg.columns and 'trend_8' in self.df_agg.columns:
+            self.df_agg['accel_4_8'] = self.df_agg['trend_4'] - self.df_agg['trend_8']
+            accel_features.append('accel_4_8')
+            
+        if 'trend_8' in self.df_agg.columns and 'trend_12' in self.df_agg.columns:
+            self.df_agg['accel_8_12'] = self.df_agg['trend_8'] - self.df_agg['trend_12']
+            accel_features.append('accel_8_12')
+            
+        print(f"    → {len(accel_features)} features de aceleração criadas")
+        
+        # 9️⃣ FEATURES DE MOMENTUM
+        print("  → Criando features de momentum...")
+        momentum_features = []
+        
+        # Momentum como razão entre médias de diferentes períodos
+        for short, long in [(4, 8), (8, 12), (4, 12)]:
+            short_col = f'rmean_{short}'
+            long_col = f'rmean_{long}'
+            
+            if short_col in self.df_agg.columns and long_col in self.df_agg.columns:
+                momentum_col = f'momentum_{short}_{long}'
+                self.df_agg[momentum_col] = self.df_agg[short_col] / (self.df_agg[long_col] + 0.01)
+                momentum_features.append(momentum_col)
+                
+        print(f"    → {len(momentum_features)} features de momentum criadas")
+        
+        # 🔟 PREENCHER NAs E FINALIZAR
+        print("  → Preenchendo valores ausentes...")
+        
+        # Coletar todas as novas features criadas
+        new_features = (additional_lags + rolling_features + pct_features + seasonal_features + 
+                       distribution_features + event_features + trend_features + accel_features + momentum_features)
+        
+        # Adicionar prefixo 'lag_' para lags adicionais
+        new_lag_features = [f'lag_{lag}' for lag in additional_lags]
+        all_new_features = new_lag_features + [f for f in new_features if not f.startswith('lag_')]
+        
+        # Preencher NAs
+        for feature in all_new_features:
+            if feature in self.df_agg.columns:
+                if feature.startswith(('lag_', 'rmean_', 'rstd_', 'rmax_', 'rmin_', 'rrange_', 'rskew_', 'trend_')):
+                    self.df_agg[feature] = self.df_agg[feature].fillna(0)
+                elif feature.startswith('pct_change_'):
+                    self.df_agg[feature] = self.df_agg[feature].fillna(0)
+                elif feature.startswith(('rcv_', 'momentum_', 'accel_')):
+                    self.df_agg[feature] = self.df_agg[feature].fillna(1)  # Razões defaultam para 1
+                else:
+                    self.df_agg[feature] = self.df_agg[feature].fillna(0)
+        
+        print(f"✅ {len(all_new_features)} features avançadas criadas e processadas!")
+        
+        # Atualizar lista de features
+        basic_lag_cols = [c for c in self.df_agg.columns if c.startswith('lag_')] + ['rmean_4', 'rstd_4', 'nonzero_frac_8']
+        advanced_feature_cols = [f for f in all_new_features if f in self.df_agg.columns]
+        
+        return advanced_feature_cols
+    
+    def create_interaction_features(self, max_interactions=20):
+        """Cria features de interação entre variáveis categóricas e numéricas"""
+        print("🤝 Criando features de interação...")
+        
+        interaction_features = []
+        created_count = 0
+        
+        # Identificar features categóricas e numéricas principais
+        categorical_cols = [col for col in self.df_agg.columns if col.startswith(('categoria_', 'premise_', 'tipos_', 'label_'))]
+        key_numerical_cols = ['lag_1', 'lag_2', 'rmean_4', 'rmean_8', 'trend_4', 'momentum_4_8']
+        
+        # Filtrar apenas colunas que existem
+        categorical_cols = [col for col in categorical_cols if col in self.df_agg.columns]
+        key_numerical_cols = [col for col in key_numerical_cols if col in self.df_agg.columns]
+        
+        print(f"  → Categóricas disponíveis: {len(categorical_cols)}")
+        print(f"  → Numéricas principais: {len(key_numerical_cols)}")
+        
+        # Interações: categórica * numérica
+        for cat_col in categorical_cols[:5]:  # Limitar a 5 categóricas mais importantes
+            for num_col in key_numerical_cols[:4]:  # Limitar a 4 numéricas mais importantes
+                if created_count >= max_interactions:
+                    break
+                
+                interaction_name = f"{cat_col}_x_{num_col}"
+                self.df_agg[interaction_name] = self.df_agg[cat_col] * self.df_agg[num_col]
+                interaction_features.append(interaction_name)
+                created_count += 1
+                
+            if created_count >= max_interactions:
+                break
+        
+        print(f"  → {len(interaction_features)} features de interação criadas")
+        return interaction_features
+    
+    def create_comprehensive_features(self, use_advanced=True, use_interactions=True, max_interactions=15):
+        """
+        Função principal para criar features de forma modular
+        
+        Args:
+            use_advanced (bool): Se deve criar features avançadas (além das básicas)
+            use_interactions (bool): Se deve criar features de interação
+            max_interactions (int): Número máximo de interações a criar
+        """
+        print("🎯 CRIANDO FEATURES COMPREENSIVAS")
+        print("=" * 50)
+        
+        # Sempre criar features básicas primeiro
+        self.create_lag_features()  # Função básica renomeada
+        print("✅ Features básicas criadas")
+        
+        all_feature_cols = [c for c in self.df_agg.columns if c.startswith('lag_')] + ['rmean_4', 'rstd_4', 'nonzero_frac_8']
+        
+        if use_advanced:
+            try:
+                advanced_cols = self.create_advanced_features()
+                all_feature_cols.extend(advanced_cols)
+                print("✅ Features avançadas criadas")
+            except Exception as e:
+                print(f"⚠️ Erro ao criar features avançadas: {e}")
+                print("→ Continuando apenas com features básicas")
+        
+        # Criar features categóricas
+        self.create_categorical_features()
+        
+        if use_interactions and len(self.categorical_features) > 0:
+            try:
+                interaction_cols = self.create_interaction_features(max_interactions=max_interactions)
+                all_feature_cols.extend(interaction_cols)
+                print("✅ Features de interação criadas")
+            except Exception as e:
+                print(f"⚠️ Erro ao criar features de interação: {e}")
+                print("→ Continuando sem features de interação")
+        
+        # Definir colunas finais de features
+        base_features = ['week_of_year'] + all_feature_cols
+        self.feature_columns = base_features + self.categorical_features
+        
+        print(f"\n📊 RESUMO DAS FEATURES:")
+        print(f"  → Features básicas: {len([c for c in all_feature_cols if c.startswith('lag_') or c in ['rmean_4', 'rstd_4', 'nonzero_frac_8']])}")
+        if use_advanced:
+            print(f"  → Features avançadas: {len([c for c in all_feature_cols if not (c.startswith('lag_') or c in ['rmean_4', 'rstd_4', 'nonzero_frac_8']) and not c.endswith('_x_')])}")
+        if use_interactions:
+            print(f"  → Features de interação: {len([c for c in all_feature_cols if '_x_' in c])}")
+        print(f"  → Features categóricas: {len(self.categorical_features)}")
+        print(f"  → TOTAL DE FEATURES: {len(self.feature_columns)}")
+        print("=" * 50)
+        
         return self.df_agg
     
     def create_categorical_features(self):
@@ -1419,7 +1717,7 @@ class DataProcessor:
         
         return X, y
 
-def process_data(file_path, treat_outliers=True, outlier_params=None):
+def process_data(file_path, treat_outliers=True, outlier_params=None, use_advanced_features=True, use_interactions=True):
     """
     Função principal para processar dados completos
     
@@ -1427,6 +1725,8 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
         file_path (str): Caminho para o arquivo de dados
         treat_outliers (bool): Se deve aplicar tratamento de outliers
         outlier_params (dict): Parâmetros para tratamento de outliers personalizado
+        use_advanced_features (bool): Se deve criar features avançadas
+        use_interactions (bool): Se deve criar features de interação
     """
     if outlier_params is None:
         outlier_params = OUTLIER_PARAMS
@@ -1462,7 +1762,12 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
     else:
         outlier_analysis = None
     
-    processor.create_lag_features()
+    # CRIAR FEATURES COM NOVA FUNÇÃO MODULAR
+    processor.create_comprehensive_features(
+        use_advanced=use_advanced_features,
+        use_interactions=use_interactions,
+        max_interactions=15
+    )
 
     # Dividir dados
     from .config import TRAIN_CUTOFF, VALID_START, VALID_END

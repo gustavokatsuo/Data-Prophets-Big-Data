@@ -3,6 +3,7 @@
 *.parquet
 *.json
 *.data
+*.pkl
 
 # Ambiente Virtual
 venv/
