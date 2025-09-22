@@ -361,8 +361,12 @@ class Predictor:
         if original_count != filtered_count:
             print(f"   → Removidos {original_count - filtered_count:,} registros com PDV inválido")
         
-        pdv_prod_list = aggregated_data_clean[['pdv', 'internal_product_id']].drop_duplicates().values
-        print(f"   → {len(pdv_prod_list):,} combinações totais encontradas")
+        # Selecionar apenas combinações com histórico de vendas real (qty > 0) - Tentativa de reduzir o número de predições desnecessárias
+        sales_by_combination = aggregated_data_clean.groupby(['pdv', 'internal_product_id'])['qty'].sum()
+        active_combinations = sales_by_combination[sales_by_combination > 0].reset_index()
+
+        pdv_prod_list = active_combinations[['pdv', 'internal_product_id']].values
+        print(f"   → {len(pdv_prod_list):,} combinações com vendas históricas selecionadas para previsão")
         
         # Otimizar mapeamento de dados históricos
         print("   → Preparando dados históricos de forma otimizada...")

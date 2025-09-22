@@ -294,8 +294,11 @@ class XGBoostPredictor:
         aggregated_data_clean = aggregated_data[aggregated_data['pdv'].astype(str).str.isdigit()].copy()
         aggregated_data_clean['pdv'] = aggregated_data_clean['pdv'].astype(int)
         
-        pdv_prod_list = aggregated_data_clean[['pdv', 'internal_product_id']].drop_duplicates().values
-        print(f"   → {len(pdv_prod_list):,} combinações totais encontradas")
+        sales_by_combination = aggregated_data_clean.groupby(['pdv', 'internal_product_id'])['qty'].sum()
+        active_combinations = sales_by_combination[sales_by_combination > 0].reset_index()
+
+        pdv_prod_list = active_combinations[['pdv', 'internal_product_id']].values
+        print(f"   → {len(pdv_prod_list):,} combinações com vendas históricas selecionadas para previsão")
         
         print("   → Preparando dados históricos...")
         hist_data_map = {
