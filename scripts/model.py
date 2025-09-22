@@ -581,16 +581,27 @@ class Predictor:
             }
             hist_data_map[(pdv, sku)] = (sorted_group, hist_data_optimized)
         
-        valid_tasks = []
-        for pdv, sku in pdv_prod_list:
-            hist_tuple = hist_data_map.get((pdv, sku))
-            if hist_tuple is not None:
-                hist, hist_opt = hist_tuple
-                # Usar critério otimizado para histórico
-                if len(hist_opt['qty']) >= 8:
-                    valid_tasks.append((pdv, sku, hist))  # Manter formato original para compatibilidade
+        # DataFrame com os tamanhos do histórico
+        df_tasks = pd.DataFrame(pdv_prod_list, columns=['pdv', 'internal_product_id'])
+        df_tasks['history_len'] = df_tasks.set_index(['pdv', 'internal_product_id']).index.map(
+            lambda x: len(hist_data_map.get(x, (None, {'qty': []}))[1]['qty'])
+        )
 
-        print(f"   → {len(valid_tasks):,} combinações válidas (com histórico >= 8 semanas) para predição")
+        df_valid_tasks = df_tasks[df_tasks['history_len'] >= 12]
+
+        # Criar um DataFrame com os dados de histórico
+        df_hist_data = pd.DataFrame(
+            [(key[0], key[1], value[0]) for key, value in hist_data_map.items()],
+            columns=['pdv', 'internal_product_id', 'hist_data']
+        )
+
+        # Juntar (merge) os dois DataFrames de uma só vez
+        df_final_tasks = pd.merge(df_valid_tasks, df_hist_data, on=['pdv', 'internal_product_id'])
+
+        # Converter para o formato de lista de tuplas
+        valid_tasks = list(df_final_tasks[['pdv', 'internal_product_id', 'hist_data']].to_records(index=False))
+
+        print(f"   → {len(valid_tasks):,} combinações válidas (com histórico >= 12 semanas) para predição")
 
         if len(valid_tasks) == 0:
             print("   → ⚠️ Nenhuma combinação atendeu aos critérios de histórico mínimo. Retornando DataFrame vazio.")
