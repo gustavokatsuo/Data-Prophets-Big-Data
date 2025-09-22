@@ -5,26 +5,48 @@ import numpy as np
 from datetime import datetime
 import json
 
-def asymmetric_logcosh_objective(y_true, y_pred):
-    # Parâmetro de assimetria: penaliza mais quando y_true é 0
-    # Valores maiores que 1.0 aumentam a penalidade.
-    asymmetric_penalty = 1.5 
+def create_asymmetric_objective(penalty_weight=1.5):
+    """
+    Função fábrica que cria e retorna uma função de objetivo para o LightGBM.
     
-    # Erro residual
-    residual = y_pred - y_true
+    Esta função de objetivo penaliza mais os erros quando o valor real (y_true) é 0.
+
+    Args:
+        penalty_weight (float): Fator pelo qual a penalidade será multiplicada
+                                quando y_true == 0. Valores > 1.0 aumentam a penalidade.
+
+    Returns:
+        function: A função de objetivo (gradiente e hessiano) para ser usada no lgb.train.
+    """
     
-    # Gradiente (primeira derivada) da função Log-Cosh
-    grad = np.tanh(residual)
-    
-    # Hessiano (segunda derivada) da função Log-Cosh
-    hess = 1.0 - grad**2
-    
-    # Aplicar a penalidade assimétrica
-    # Aumenta o gradiente (e o ajuste) quando o valor real era 0
-    grad[y_true == 0] *= asymmetric_penalty
-    hess[y_true == 0] *= asymmetric_penalty # Ajusta o hessiano também
-    
-    return grad, hess
+    def asymmetric_logcosh_objective(y_true, y_pred):
+        # Garante que y_true seja um array numpy para compatibilidade
+        y_true = np.asarray(y_true)
+        
+        # 1. Calcula o erro residual
+        residual = y_pred - y_true
+        
+        # 2. Calcula o gradiente (primeira derivada da perda Log-Cosh)
+        # O gradiente indica a direção e a magnitude do erro.
+        grad = np.tanh(residual)
+        
+        # 3. Calcula o hessiano (segunda derivada da perda Log-Cosh)
+        # O hessiano ajusta o tamanho do passo do gradiente.
+        hess = 1.0 - np.square(grad)
+        
+        # 4. Aplica a penalidade assimétrica
+        # Cria uma máscara booleana para encontrar todos os pontos onde y_true é 0.
+        is_true_zero = (y_true == 0)
+        
+        # Multiplica o gradiente e o hessiano pelo fator de penalidade nesses pontos.
+        # Isso faz com que o modelo se esforce mais para corrigir erros nesses casos.
+        grad[is_true_zero] *= penalty_weight
+        hess[is_true_zero] *= penalty_weight
+        
+        return grad, hess
+
+    # Retorna a função interna, pronta para ser usada pelo LightGBM
+    return asymmetric_logcosh_objective
 
 def ensure_directories_exist(directories):
     """Garante que os diretórios existam"""

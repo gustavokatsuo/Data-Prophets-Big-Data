@@ -5,7 +5,7 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error
 import pickle
 import os
-from scripts.utils import asymmetric_logcosh_objective
+from scripts.utils import create_asymmetric_objective
 from .config import MODEL_PARAMS, TRAINING_PARAMS, PREDICTION_WEEKS
 from datetime import datetime
 import warnings
@@ -158,7 +158,8 @@ class LightGBMModel:
             valid_names.append('valid_1')
             print(f"   → Target validação transformado - Original: [{y_val.min():.2f}, {y_val.max():.2f}] → Log: [{y_val_log.min():.4f}, {y_val_log.max():.4f}]")
 
-        self.model_params['objective'] = asymmetric_logcosh_objective
+        asymmetric_objective = create_asymmetric_objective(penalty_weight=1.5)
+        self.model_params['objective'] = asymmetric_objective
 
         # Treinar modelo
         self.model = lgb.train(
@@ -167,7 +168,6 @@ class LightGBMModel:
             valid_sets=valid_sets,
             valid_names=valid_names,
             num_boost_round=self.training_params['num_boost_round'],
-            fobj=asymmetric_logcosh_objective,
             callbacks=[
                 lgb.early_stopping(self.training_params['early_stopping_rounds']),
                 lgb.log_evaluation(self.training_params['verbose_eval'])
