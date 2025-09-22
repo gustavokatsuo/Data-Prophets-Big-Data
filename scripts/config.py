@@ -13,14 +13,16 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Parâmetros do modelo LightGBM
 MODEL_PARAMS = {
-    'objective': 'tweedie', # Tweedie para dados de contagem com muitos zeros
+    'objective': 'regression_l1',  # MAE para trabalhar melhor com transformação logarítmica
     'metric': 'mae',
     'learning_rate': 0.02,
     'num_leaves': 32,
-    'min_data_in_leaf': 20,
+    'min_data_in_leaf': 50,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0.1,
     'verbose': -1, 
     'seed': 42,
-    'num_threads': cpu_count()
+    'num_threads': -1
 }
 
 # Parâmetros do modelo XGBoost

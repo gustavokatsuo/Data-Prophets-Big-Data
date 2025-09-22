@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error
 import pickle
 import os
+from scripts.utils import asymmetric_logcosh_objective
 from .config import MODEL_PARAMS, TRAINING_PARAMS, PREDICTION_WEEKS
 from datetime import datetime
 import warnings
@@ -137,19 +138,28 @@ class LightGBMModel:
         self.best_iteration = None
         
     def train(self, X_train, y_train, X_val=None, y_val=None):
-        """Treina o modelo LightGBM"""
-        print("🤖 Treinando modelo LightGBM...")
+        """Treina o modelo LightGBM com transformação logarítmica"""
+        print("🤖 Treinando modelo LightGBM com transformação logarítmica...")
+        
+        # Aplicar transformação logarítmica nos targets
+        y_train_log = np.log1p(y_train)
+        print(f"   → Target transformado - Original: [{y_train.min():.2f}, {y_train.max():.2f}] → Log: [{y_train_log.min():.4f}, {y_train_log.max():.4f}]")
         
         # Datasets do LightGBM
-        dtrain = lgb.Dataset(X_train, label=y_train)
+        dtrain = lgb.Dataset(X_train, label=y_train_log)
         valid_sets = [dtrain]
         valid_names = ['training']
         
+        y_val_log = None
         if X_val is not None and y_val is not None:
-            dval = lgb.Dataset(X_val, label=y_val)
+            y_val_log = np.log1p(y_val)
+            dval = lgb.Dataset(X_val, label=y_val_log)
             valid_sets.append(dval)
             valid_names.append('valid_1')
-        
+            print(f"   → Target validação transformado - Original: [{y_val.min():.2f}, {y_val.max():.2f}] → Log: [{y_val_log.min():.4f}, {y_val_log.max():.4f}]")
+
+        self.model_params['objective'] = asymmetric_logcosh_objective
+
         # Treinar modelo
         self.model = lgb.train(
             self.model_params,
@@ -157,6 +167,7 @@ class LightGBMModel:
             valid_sets=valid_sets,
             valid_names=valid_names,
             num_boost_round=self.training_params['num_boost_round'],
+            fobj=asymmetric_logcosh_objective,
             callbacks=[
                 lgb.early_stopping(self.training_params['early_stopping_rounds']),
                 lgb.log_evaluation(self.training_params['verbose_eval'])
@@ -168,15 +179,24 @@ class LightGBMModel:
         
         # Calcular WMAPE de validação se disponível
         if X_val is not None and y_val is not None:
-            pred_val = self.predict(X_val)
+            # Fazer predições na escala logarítmica e reverter para escala original
+            pred_val_log = self.predict_log(X_val)
+            pred_val = np.expm1(pred_val_log)
+            
+            # Calcular WMAPE na escala original
             wmape = np.sum(np.abs(pred_val - y_val)) / np.sum(np.abs(y_val))
-            print(f'📊 WMAPE validação: {wmape:.4f}')
+            print(f'📊 WMAPE validação (escala original): {wmape:.4f}')
+            
+            # Calcular MAE na escala logarítmica para comparação
+            mae_log = np.mean(np.abs(pred_val_log - y_val_log))
+            print(f'📊 MAE validação (escala log): {mae_log:.4f}')
+            
             return wmape
         
         return None
     
-    def predict(self, X):
-        """Faz predições com o modelo treinado, lidando com a mudança de versão do LightGBM."""
+    def predict_log(self, X):
+        """Faz predições na escala logarítmica (sem transformação inversa)"""
         if self.model is None:
             raise ValueError("Modelo não foi treinado. Execute train() primeiro.")
         
@@ -191,6 +211,19 @@ class LightGBMModel:
                 return self.model.predict(X, iteration=self.best_iteration)
             except:
                 return self.model.predict(X)
+    
+    def predict(self, X):
+        """Faz predições com o modelo treinado e aplica transformação inversa"""
+        # Fazer predição na escala logarítmica
+        pred_log = self.predict_log(X)
+        
+        # Aplicar transformação inversa para retornar à escala original
+        pred_original = np.expm1(pred_log)
+        
+        # Garantir que não há valores negativos (devido a imprecisões numéricas)
+        pred_original = np.maximum(pred_original, 0)
+        
+        return pred_original
     
     def get_feature_importance(self, importance_type='gain', max_features=None):
         """Retorna feature importance"""

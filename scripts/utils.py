@@ -5,6 +5,27 @@ import numpy as np
 from datetime import datetime
 import json
 
+def asymmetric_logcosh_objective(y_true, y_pred):
+    # Parâmetro de assimetria: penaliza mais quando y_true é 0
+    # Valores maiores que 1.0 aumentam a penalidade.
+    asymmetric_penalty = 1.5 
+    
+    # Erro residual
+    residual = y_pred - y_true
+    
+    # Gradiente (primeira derivada) da função Log-Cosh
+    grad = np.tanh(residual)
+    
+    # Hessiano (segunda derivada) da função Log-Cosh
+    hess = 1.0 - grad**2
+    
+    # Aplicar a penalidade assimétrica
+    # Aumenta o gradiente (e o ajuste) quando o valor real era 0
+    grad[y_true == 0] *= asymmetric_penalty
+    hess[y_true == 0] *= asymmetric_penalty # Ajusta o hessiano também
+    
+    return grad, hess
+
 def ensure_directories_exist(directories):
     """Garante que os diretórios existam"""
     for directory in directories:
