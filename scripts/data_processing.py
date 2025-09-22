@@ -222,6 +222,9 @@ class DataProcessor:
         
         # Renomear colunas principais
         self.df_agg = self.df_agg.rename(columns={'quantity': 'qty', 'gross_value': 'gross'})
+
+        # Garantir que não há quantidades negativas, desconsidera devoluções porém não vicia o modelo
+        self.df_agg['qty'] = self.df_agg['qty'].clip(lower=0)
         
         # INTERPOLAÇÃO: Preencher lacuna da semana 37 removida
         if 37 not in self.df_agg['week_of_year'].values and 36 in self.df_agg['week_of_year'].values and 38 in self.df_agg['week_of_year'].values:
@@ -1466,8 +1469,11 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
     processor.create_lag_features()
     
     # Dividir dados
-    train_data, valid_data = processor.split_train_validation()
-    
+    from .config import TRAIN_CUTOFF, VALID_START, VALID_END
+    train_data, valid_data = processor.split_train_validation(train_cutoff=TRAIN_CUTOFF, 
+                                                             valid_start=VALID_START, 
+                                                             valid_end=VALID_END)
+
     # Preparar features e targets
     X_train, y_train = processor.prepare_features_target(train_data)
     X_val, y_val = processor.prepare_features_target(valid_data)

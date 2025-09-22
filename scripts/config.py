@@ -53,13 +53,13 @@ DUMMY_FEATURES = ['categoria', 'premise', 'tipos', 'label']
 # Features categóricas para embedding
 EMBEDDING_FEATURES = ['subcategoria', 'fabricante', 'descricao', 'marca']
 
-# Configurações de embedding com Autoencoders OTIMIZADAS
+# Configurações de embedding com Autoencoders
 EMBEDDING_CONFIG = {
-    'n_components': 8,  # Reduzido para economizar memória
-    'max_unique_values': 100,  # Aumentado - agora suporta mais categorias eficientemente
+    'n_components': 12,  # Aumentado para melhor representação
+    'max_unique_values': 200,  # Aumentado - agora suporta mais categorias eficientemente
     'min_frequency': 10,  # Aumentado para reduzir categorias raras
     'autoencoder_params': {
-        'embedding_dim': 8,     # Reduzido para economizar memória
+        'embedding_dim': 12,     # Aumentado para melhor representação
         'epochs': 50,           # Reduzido para treino mais rápido
         'batch_size': 128,      # Aumentado para eficiência
         'learning_rate': 0.002, # Ligeiramente aumentado
@@ -67,7 +67,7 @@ EMBEDDING_CONFIG = {
         'early_stopping_patience': 8,  # Reduzido
         'encoder_layers': [32],         # Arquitetura muito mais leve
         'decoder_layers': [32],         # Arquitetura muito mais leve
-        'max_samples_per_category': 100 # Novo: limita amostras por categoria
+        'max_samples_per_category': 100 # Limita amostras por categoria
     }
 }
 
