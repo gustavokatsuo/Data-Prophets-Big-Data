@@ -489,7 +489,8 @@ def generate_predictions(model, data_dict, weeks=None, parallel=True, save_path=
         parallel=parallel
     )
     
-    # Reordenar colunas para o formato solicitado: semana, pdv, produto, quantidade
+    predictions_df['predicted_qty'] = predictions_df['predicted_qty'].apply(lambda x: x if x >= 0.5 else 0) # Thresholding
+
     predictions_formatted = pd.DataFrame({
         'semana': predictions_df['week'].astype(int),
         'pdv': predictions_df['pdv'].astype(int),

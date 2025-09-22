@@ -304,23 +304,22 @@ class DataProcessor:
         for lag in LAG_FEATURES:
             self.df_agg[f'lag_{lag}'] = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty'].shift(lag)
         
-        # Features rolling - CORRIGIDO PARA EVITAR VAZAMENTO
+        # Features rolling
         print("  → Criando features rolling...")
         grouped = self.df_agg.groupby(['pdv', 'internal_product_id'])['qty']
-        # MUDANÇA: min_periods=4 para evitar vazamento de dados com poucos pontos
+
         self.df_agg['rmean_4'] = grouped.shift(1).rolling(4, min_periods=4).mean()
         print("    → Média móvel 4 criada (min_periods=4)")
         
-        # MUDANÇA: min_periods=4 para consistência
         self.df_agg['rstd_4'] = grouped.shift(1).rolling(4, min_periods=4).std()
         print("    → Desvio padrão móvel 4 criado (min_periods=4)")
         
-        # Otimização para fração de não zeros - CORRIGIDO
+        # Otimização para fração de não zeros
         is_nonzero = (self.df_agg['qty'] > 0).astype('int8')
         self.df_agg['nonzero_frac_8'] = (
             is_nonzero.groupby([self.df_agg['pdv'], self.df_agg['internal_product_id']])
             .shift(1)
-            .rolling(8, min_periods=8)  # MUDANÇA: min_periods=8
+            .rolling(8, min_periods=8)
             .mean()
         )
         print("    → Fração de não zeros nas últimas 8 criada")
@@ -331,9 +330,6 @@ class DataProcessor:
         
         # Criar features categóricas
         self.create_categorical_features()
-        
-        # REMOVIDO: create_unit_price_features() - pode causar vazamento
-        # As features de preço foram removidas para evitar data leakage
         
         # Definir colunas de features básicas (removido 'gross' para evitar data leakage)
         base_features = ['week_of_year'] + lag_cols
@@ -357,8 +353,8 @@ class DataProcessor:
         if not available_dummy and not available_embedding:
             print("   → Nenhuma coluna categórica encontrada nos dados agregados")
             return
-        
-        # 1. Features Dummy (One-Hot Encoding) - SEM VAZAMENTO
+
+        # 1. Features Dummy (One-Hot Encoding)
         for col in available_dummy:
             print(f"  → Criando dummies para {col}...")
             # Usar apenas as top categorias mais frequentes (sem target info)
@@ -373,7 +369,7 @@ class DataProcessor:
         
         # 2. Features de Embedding - REMOVENDO EMBEDDINGS SUPERVISIONADOS
         for col in available_embedding:
-            print(f"  → Criando features simples para {col} (sem vazamento)...")
+            print(f"  → Criando features simples para {col}...")
             
             # Substituir embeddings complexos por features simples baseadas apenas em frequência
             value_counts = self.df_agg[col].value_counts()
@@ -389,9 +385,9 @@ class DataProcessor:
             self.categorical_features.append(f'{col}_freq_rank')
             
             print(f"    → 2 features simples criadas para {col} (log_freq + freq_rank)")
-        
-        print(f"   → Total de {len(self.categorical_features)} features categóricas criadas (SEM VAZAMENTO)")
-    
+
+        print(f"   → Total de {len(self.categorical_features)} features categóricas criadas")
+
     def _estimate_memory_usage(self, n_unique, n_samples):
         """
         Estima uso de memória para one-hot encoding (método antigo)
@@ -400,12 +396,10 @@ class DataProcessor:
         memory_bytes = n_samples * n_unique * 4
         memory_gb = memory_bytes / (1024**3)
         return memory_gb
-        
     
     def _create_autoencoder_embeddings(self, categorical_series, target_series, n_unique, embedding_dim=10):
         """
         Cria embeddings usando Autoencoders para capturar padrões complexos nas categorias
-        OTIMIZADO PARA USAR MENOS MEMÓRIA
         
         Args:
             categorical_series: Série categórica processada
@@ -1443,6 +1437,8 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
     processor.load_data(file_path)
     processor.aggregate_data()
     
+    processor.df_agg = processor.df_agg[processor.df_agg['week_of_year'] != 53]
+
     # Salvar dados antes do tratamento de outliers para comparação
     df_before_outliers = processor.df_agg.copy() if treat_outliers else None
     
@@ -1467,7 +1463,7 @@ def process_data(file_path, treat_outliers=True, outlier_params=None):
         outlier_analysis = None
     
     processor.create_lag_features()
-    
+
     # Dividir dados
     from .config import TRAIN_CUTOFF, VALID_START, VALID_END
     train_data, valid_data = processor.split_train_validation(train_cutoff=TRAIN_CUTOFF, 

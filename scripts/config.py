@@ -13,7 +13,7 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Parâmetros do modelo LightGBM
 MODEL_PARAMS = {
-    'objective': 'regression',
+    'objective': 'tweedie', # Tweedie para dados de contagem com muitos zeros
     'metric': 'mae',
     'learning_rate': 0.02,
     'num_leaves': 32,
