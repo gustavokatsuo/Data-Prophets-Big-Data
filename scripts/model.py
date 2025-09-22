@@ -77,20 +77,20 @@ def _predict_single_fast(pdv, sku, hist_data, model, feature_columns, weeks, cat
             
             # Rolling features otimizadas
             # Exclusão da semana mais recente para evitar predições esponenciais (lag_1)
-            hist_para_media = qty_values[:-1] if len(qty_values) > 1 else np.array([]) 
-
-            if len(hist_para_media) >= 4:
-                window = hist_para_media[-4:]
+            if len(qty_values) >= 4:
+                window = qty_values[-4:] # Usar os 4 valores mais recentes
                 features_dict['rmean_4'] = np.mean(window)
                 features_dict['rstd_4'] = np.std(window)
             else:
-                features_dict['rmean_4'] = np.mean(hist_para_media) if len(hist_para_media) > 0 else 0
-                features_dict['rstd_4'] = np.std(hist_para_media) if len(hist_para_media) > 1 else 0
+                features_dict['rmean_4'] = np.mean(qty_values) if len(qty_values) > 0 else 0
+                features_dict['rstd_4'] = np.std(qty_values) if len(qty_values) > 1 else 0
 
-            # Nonzero fraction (deve usar a mesma lógica de shift)
-            hist_para_nonzero = qty_values[:-1] if len(qty_values) > 1 else np.array([])
-            nz_window = hist_para_nonzero[-8:] if len(hist_para_nonzero) >= 8 else hist_para_nonzero
-            features_dict['nonzero_frac_8'] = np.mean(nz_window > 0) if len(nz_window) > 0 else 0
+            # Nonzero fraction
+            if len(qty_values) >= 8:
+                nonzero_values = qty_values[-8:]
+            else:
+                nonzero_values = qty_values
+            features_dict['nonzero_frac_8'] = np.mean(nonzero_values > 0) if len(nonzero_values) > 0 else 0
                         
             # Adicionar features categóricas do cache
             features_dict.update(categorical_features)

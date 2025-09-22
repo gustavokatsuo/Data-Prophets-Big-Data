@@ -198,19 +198,20 @@ def _predict_single_fast_xgb(pdv, sku, hist_data, model, feature_columns, cleane
                 features_dict[f'lag_{lag}'] = lag_values[i]
             
             # Rolling features com correção de data leakage
-            hist_para_media = qty_values[:-1] if n_qty > 1 else np.array([])
-            if len(hist_para_media) >= 4:
-                window = hist_para_media[-4:]
+            if n_qty >= 4:
+                window = qty_values[-4:]
                 features_dict['rmean_4'] = np.mean(window)
                 features_dict['rstd_4'] = np.std(window)
             else:
-                features_dict['rmean_4'] = np.mean(hist_para_media) if len(hist_para_media) > 0 else 0
-                features_dict['rstd_4'] = np.std(hist_para_media) if len(hist_para_media) > 1 else 0
+                features_dict['rmean_4'] = np.mean(qty_values) if n_qty > 0 else 0
+                features_dict['rstd_4'] = np.std(qty_values) if n_qty > 1 else 0
 
             # Nonzero fraction
-            hist_para_nonzero = qty_values[:-1] if n_qty > 1 else np.array([])
-            nz_window = hist_para_nonzero[-8:] if len(hist_para_nonzero) >= 8 else hist_para_nonzero
-            features_dict['nonzero_frac_8'] = np.mean(nz_window > 0) if len(nz_window) > 0 else 0
+            if n_qty >= 8:
+                nonzero_values = qty_values[-8:]
+            else:
+                nonzero_values = qty_values
+            features_dict['nonzero_frac_8'] = np.mean(nonzero_values > 0) if len(nonzero_values) > 0 else 0
             
             features_dict.update(categorical_features)
             
