@@ -6,8 +6,28 @@ from .config import LAG_FEATURES, OUTLIER_PARAMS, DUMMY_FEATURES, EMBEDDING_FEAT
 import warnings
 import multiprocessing as mp
 from functools import partial
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+try:
+    from tensorflow.keras.models import Model
+    from tensorflow.keras.layers import Input, Dense, Embedding, Flatten
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.callbacks import EarlyStopping
+    from tensorflow.keras.utils import to_categorical
+    import tensorflow as tf
+    tf.get_logger().setLevel('ERROR')  # Reduzir logs do TensorFlow
+    # Configurar TensorFlow para usar menos memória
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(f"GPU memory config error: {e}")
+    TENSORFLOW_AVAILABLE = True
+except ImportError:
+    print("⚠️ TensorFlow não disponível. Usando método PCA como fallback.")
+    from sklearn.decomposition import PCA
+    TENSORFLOW_AVAILABLE = False
 warnings.filterwarnings('ignore')
 
 def _process_outlier_group_wrapper(args):
@@ -141,7 +161,7 @@ class DataProcessor:
         self.feature_columns = None
         self.dummy_encoders = {}
         self.label_encoders = {}
-        self.pca_transformers = {}
+        self.autoencoder_transformers = {}  # Para armazenar autoencoders treinados
         self.categorical_features = []
         
     def load_data(self, file_path):
@@ -193,7 +213,7 @@ class DataProcessor:
             'gross_value': 'sum'
         }
         
-        # Para colunas categóricas, usar 'first' (assumindo que são constantes por PDV-produto)
+        # Para colunas categóricas, usar 'first'
         for col in available_categorical:
             agg_dict[col] = 'first'
         
@@ -341,7 +361,7 @@ class DataProcessor:
             
             print(f"    → {len(unique_values)} dummies criadas para {col}")
         
-        # 2. Features de Embedding (usando PCA)
+        # 2. Features de Embedding (usando Autoencoders OTIMIZADOS)
         for col in available_embedding:
             print(f"  → Criando embeddings para {col}...")
             
@@ -354,35 +374,47 @@ class DataProcessor:
                 lambda x: x if x in valid_categories else 'outros'
             )
             
-            # Label Encoding
-            le = LabelEncoder()
-            encoded_values = le.fit_transform(self.df_agg[f'{col}_processed'].fillna('outros'))
+            # Verificação de memória preventiva
+            n_unique = self.df_agg[f'{col}_processed'].nunique()
+            n_samples = len(self.df_agg)
+            estimated_memory_gb = self._estimate_memory_usage(n_unique, n_samples)
             
-            # Se há muitas categorias únicas, usar PCA para reduzir dimensionalidade
-            n_unique = len(le.classes_)
+            print(f"    → {n_unique} categorias, {n_samples:,} amostras")
+            print(f"    → Memória estimada: {estimated_memory_gb:.2f} GB")
+            
+            # Se há muitas categorias únicas, usar Autoencoders otimizados
             if n_unique > EMBEDDING_CONFIG['max_unique_values']:
-                print(f"    → {n_unique} categorias, aplicando PCA...")
-                
-                # Criar matriz de embeddings simples (baseada em frequência e co-ocorrência)
-                embedding_matrix = self._create_simple_embeddings(self.df_agg[f'{col}_processed'], n_unique)
-                
-                # Aplicar PCA
-                pca = PCA(n_components=min(EMBEDDING_CONFIG['n_components'], n_unique-1))
-                reduced_embeddings = pca.fit_transform(embedding_matrix)
-                
-                # Mapear de volta para os dados
-                for i in range(reduced_embeddings.shape[1]):
-                    feature_name = f'{col}_emb_{i}'
-                    self.df_agg[feature_name] = reduced_embeddings[encoded_values, i]
-                    self.categorical_features.append(feature_name)
-                
-                # Salvar transformadores para predições futuras
-                self.label_encoders[col] = le
-                self.pca_transformers[col] = (pca, embedding_matrix)
-                
-                print(f"    → {reduced_embeddings.shape[1]} componentes PCA criados para {col}")
+                if estimated_memory_gb > 8.0:  # Limite de segurança
+                    print(f"    ⚠️ Memória estimada muito alta, usando target encoding como fallback")
+                    # Fallback para target encoding
+                    target_means = self.df_agg.groupby(f'{col}_processed')['qty'].mean()
+                    self.df_agg[f'{col}_target_enc'] = self.df_agg[f'{col}_processed'].map(target_means)
+                    self.categorical_features.append(f'{col}_target_enc')
+                    self.label_encoders[col] = target_means
+                else:
+                    print(f"    → Aplicando Autoencoders OTIMIZADOS...")
+                    
+                    # Criar embeddings usando Autoencoders otimizados
+                    embeddings, encoder, le = self._create_autoencoder_embeddings(
+                        self.df_agg[f'{col}_processed'], 
+                        self.df_agg['qty'],  # Target para embeddings supervisionados
+                        n_unique,
+                        EMBEDDING_CONFIG['n_components']
+                    )
+                    
+                    # Adicionar embeddings como features
+                    for i in range(embeddings.shape[1]):
+                        feature_name = f'{col}_ae_{i}'  # ae = autoencoder
+                        self.df_agg[feature_name] = embeddings[:, i]
+                        self.categorical_features.append(feature_name)
+                    
+                    # Salvar transformadores para predições futuras
+                    self.label_encoders[col] = le
+                    self.autoencoder_transformers[col] = encoder
+                    
+                    print(f"    → {embeddings.shape[1]} embeddings criados para {col} usando Autoencoders")
             else:
-                # Para poucas categorias, usar embeddings simples baseados em target encoding
+                # Para poucas categorias, usar target encoding simples
                 target_means = self.df_agg.groupby(f'{col}_processed')['qty'].mean()
                 self.df_agg[f'{col}_target_enc'] = self.df_agg[f'{col}_processed'].map(target_means)
                 self.categorical_features.append(f'{col}_target_enc')
@@ -391,12 +423,406 @@ class DataProcessor:
                 self.label_encoders[col] = target_means
                 
                 print(f"    → Target encoding criado para {col}")
-            
+                print(f"   → Total de {len(self.categorical_features)} features categóricas criadas")
             # Remover coluna temporária
             self.df_agg.drop(f'{col}_processed', axis=1, inplace=True)
-        
-        print(f"   → Total de {len(self.categorical_features)} features categóricas criadas")
     
+    def _estimate_memory_usage(self, n_unique, n_samples):
+        """
+        Estima uso de memória para one-hot encoding (método antigo)
+        """
+        # One-hot matrix: n_samples * n_unique * 4 bytes (float32)
+        memory_bytes = n_samples * n_unique * 4
+        memory_gb = memory_bytes / (1024**3)
+        return memory_gb
+        
+    
+    def _create_autoencoder_embeddings(self, categorical_series, target_series, n_unique, embedding_dim=10):
+        """
+        Cria embeddings usando Autoencoders para capturar padrões complexos nas categorias
+        OTIMIZADO PARA USAR MENOS MEMÓRIA
+        
+        Args:
+            categorical_series: Série categórica processada
+            target_series: Série target para embeddings supervisionados
+            n_unique: Número de categorias únicas
+            embedding_dim: Dimensão do espaço de embedding
+        
+        Returns:
+            embeddings: Array com embeddings para cada categoria
+            autoencoder: Modelo treinado para aplicar em novos dados
+        """
+        if not TENSORFLOW_AVAILABLE:
+            print("    → TensorFlow não disponível, usando PCA como fallback...")
+            return self._create_pca_embeddings(categorical_series, n_unique, embedding_dim)
+        
+        print(f"    → Treinando Autoencoder OTIMIZADO para {n_unique} categorias...")
+        
+        # Pegar parâmetros de configuração
+        ae_params = EMBEDDING_CONFIG.get('autoencoder_params', {})
+        encoder_layers = ae_params.get('encoder_layers', [64, 32])  # Reduzido
+        decoder_layers = ae_params.get('decoder_layers', [32, 64])  # Reduzido
+        learning_rate = ae_params.get('learning_rate', 0.001)
+        epochs = ae_params.get('epochs', 50)  # Reduzido
+        batch_size = ae_params.get('batch_size', 64)  # Aumentado para eficiência
+        validation_split = ae_params.get('validation_split', 0.15)  # Reduzido
+        patience = ae_params.get('early_stopping_patience', 8)  # Reduzido
+        
+        # OTIMIZAÇÃO 1: Usar embeddings de entrada em vez de one-hot
+        le = LabelEncoder()
+        encoded_labels = le.fit_transform(categorical_series.fillna('outros'))
+        
+        # OTIMIZAÇÃO 2: Preparar features contextuais mais leves
+        context_features = self._create_lightweight_context_features(categorical_series, target_series)
+        
+        # OTIMIZAÇÃO 3: Usar método ultra-eficiente para datasets grandes
+        if n_unique > 200 or len(encoded_labels) > 100000:
+            print(f"    → Dataset grande detectado, usando método ULTRA-EFICIENTE")
+            category_embeddings = self._train_embeddings_efficient(
+                encoded_labels, target_series, n_unique, embedding_dim,
+                epochs, batch_size, learning_rate
+            )
+        else:
+            # Método original otimizado para datasets menores
+            category_embeddings = self._train_category_embeddings_batched(
+                encoded_labels, context_features, n_unique, embedding_dim,
+                epochs, batch_size, learning_rate, patience
+            )
+        
+        # Mapear embeddings para cada registro
+        embeddings = category_embeddings[encoded_labels]
+        
+        print(f"    → Autoencoder OTIMIZADO treinado com {len(category_embeddings)} embeddings únicos")
+        print(f"    → Memória economizada: ~{self._estimate_memory_savings(n_unique, len(encoded_labels))}")
+        
+        # Criar encoder simples para novos dados
+        encoder = self._create_simple_encoder(category_embeddings, le)
+        
+        return embeddings, encoder, le
+    
+    def _create_lightweight_context_features(self, categorical_series, target_series):
+        """
+        Cria features contextuais mais leves usando agregações eficientes
+        """
+        # Calcular estatísticas por categoria de forma mais eficiente
+        df_temp = pd.DataFrame({
+            'category': categorical_series,
+            'target': target_series
+        })
+        
+        # Usar apenas estatísticas essenciais para economizar memória
+        category_stats = df_temp.groupby('category')['target'].agg([
+            'mean', 'std', 'count'  # Reduzido de 6 para 3 estatísticas
+        ]).fillna(0)
+        
+        # Normalizar para economizar espaço
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        category_stats_norm = scaler.fit_transform(category_stats.values)
+        
+        # Mapear de volta (mais eficiente que loop)
+        category_to_idx = {cat: idx for idx, cat in enumerate(category_stats.index)}
+        context_features = np.array([
+            category_stats_norm[category_to_idx.get(cat, 0)] 
+            for cat in categorical_series
+        ])
+        
+        return context_features
+    
+    def _train_category_embeddings_batched(self, encoded_labels, context_features, n_unique, 
+                                          embedding_dim, epochs, batch_size, learning_rate, patience):
+        """
+        Treina embeddings por categoria usando abordagem memory-efficient
+        """
+        # OTIMIZAÇÃO: Treinar apenas com representantes únicos de cada categoria
+        unique_categories = np.unique(encoded_labels)
+        
+        # Para cada categoria, pegar uma amostra representativa
+        category_samples = {}
+        for cat in unique_categories:
+            mask = encoded_labels == cat
+            indices = np.where(mask)[0]
+            
+            # Pegar no máximo 100 exemplos por categoria para treino
+            if len(indices) > 100:
+                sample_indices = np.random.choice(indices, 100, replace=False)
+            else:
+                sample_indices = indices
+            
+            # Média das features contextuais para esta categoria
+            avg_context = np.mean(context_features[sample_indices], axis=0)
+            category_samples[cat] = avg_context
+        
+        print(f"    → Treinando com {len(category_samples)} amostras representativas")
+        
+        # Criar dados de treino compactos
+        X_train = np.array(list(category_samples.values()))
+        
+        # Arquitetura simplificada para economizar memória
+        input_dim = X_train.shape[1]  # 3 features contextuais
+        
+        # Modelo mais simples
+        input_layer = Input(shape=(input_dim,))
+        
+        # Encoder mais leve
+        x = Dense(32, activation='relu')(input_layer)  # Reduzido
+        embedding_layer = Dense(embedding_dim, activation='linear', name='embedding')(x)
+        
+        # Decoder mais leve
+        x = Dense(32, activation='relu')(embedding_layer)  # Reduzido
+        output_layer = Dense(input_dim, activation='linear')(x)
+        
+        # Modelo
+        autoencoder = Model(input_layer, output_layer)
+        encoder = Model(input_layer, embedding_layer)
+        
+        # Compilar
+        autoencoder.compile(
+            optimizer=Adam(learning_rate=learning_rate),
+            loss='mse'
+        )
+        
+        # Treinar com dados compactos
+        early_stopping = EarlyStopping(
+            monitor='loss',  # Sem validação para economizar memória
+            patience=patience,
+            restore_best_weights=True,
+            verbose=0
+        )
+        
+        # Treinar
+        autoencoder.fit(
+            X_train, X_train,
+            epochs=epochs,
+            batch_size=min(batch_size, len(X_train)),
+            callbacks=[early_stopping],
+            verbose=0
+        )
+        
+        # Gerar embeddings para todas as categorias
+        category_embeddings = encoder.predict(X_train, verbose=0)
+        
+        # Criar lookup array
+        embeddings_lookup = np.zeros((n_unique, embedding_dim))
+        for i, cat in enumerate(category_samples.keys()):
+            embeddings_lookup[cat] = category_embeddings[i]
+        
+        return embeddings_lookup
+    
+    def _train_embeddings_efficient(self, encoded_labels, target_series, n_unique, 
+                                   embedding_dim, epochs, batch_size, learning_rate):
+        """
+        Método ultra-eficiente usando Embedding layers em vez de one-hot
+        """
+        print(f"    → Usando método ULTRA-EFICIENTE com Embedding layers")
+        
+        # Usar Embedding layer do TensorFlow (muito mais eficiente que one-hot)
+        input_layer = Input(shape=(1,), dtype='int32')
+        
+        # Embedding layer - mapeia diretamente índices para vetores densos
+        embedding_layer = Embedding(
+            input_dim=n_unique,
+            output_dim=embedding_dim,
+            input_length=1
+        )(input_layer)
+        
+        # Flatten para usar como features
+        x = Flatten()(embedding_layer)
+        
+        # Predição do target (modelo supervisionado simples)
+        target_pred = Dense(1, activation='linear')(x)
+        
+        # Modelo simples: apenas predição supervisionada
+        model = Model(input_layer, target_pred)
+        
+        # Compilar para tarefa supervisionada
+        model.compile(
+            optimizer=Adam(learning_rate=learning_rate),
+            loss='mse'
+        )
+        
+        # Preparar dados
+        X_input = encoded_labels.reshape(-1, 1)
+        y_target = target_series.values.reshape(-1, 1)
+        
+        # Subsampling para treino eficiente
+        if len(X_input) > 50000:  # Se muitos dados, fazer subsample
+            indices = np.random.choice(len(X_input), 50000, replace=False)
+            X_sample = X_input[indices]
+            y_sample = y_target[indices]
+        else:
+            X_sample = X_input
+            y_sample = y_target
+        
+        print(f"    → Treinando com {len(X_sample):,} amostras")
+        
+        # Treinar
+        early_stopping = EarlyStopping(
+            monitor='loss',
+            patience=5,
+            restore_best_weights=True,
+            verbose=0
+        )
+        
+        model.fit(
+            X_sample, y_sample,
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=[early_stopping],
+            verbose=0
+        )
+        
+        # Criar modelo para extrair embeddings
+        embedding_model = Model(input_layer, x)
+        
+        # Extrair embeddings para todas as categorias
+        unique_cats = np.arange(n_unique).reshape(-1, 1)
+        embeddings_per_category = embedding_model.predict(unique_cats, verbose=0)
+        
+        return embeddings_per_category
+    
+    def _create_simple_encoder(self, category_embeddings, le):
+        """
+        Cria um encoder simples que é apenas um lookup table
+        """
+        class SimpleEncoder:
+            def __init__(self, embeddings_lookup, label_encoder):
+                self.embeddings_lookup = embeddings_lookup
+                self.label_encoder = label_encoder
+            
+            def predict(self, X_input, verbose=0):
+                # X_input deve ser labels encoded
+                return self.embeddings_lookup[X_input.astype(int)]
+        
+        return SimpleEncoder(category_embeddings, le)
+    
+    def _estimate_memory_savings(self, n_unique, n_samples):
+        """
+        Estima economia de memória comparando com one-hot encoding
+        """
+        # One-hot seria: n_samples * n_unique * 4 bytes (float32)
+        onehot_size = n_samples * n_unique * 4 / (1024**3)  # GB
+        
+        # Método atual: lookup table pequena
+        current_size = n_unique * 10 * 4 / (1024**3)  # GB (assumindo 10 dims)
+        
+        savings = onehot_size - current_size
+        return f"{savings:.2f} GB economizados vs one-hot"
+    
+    def _create_context_features(self, categorical_series, target_series):
+        """
+        Cria features contextuais para melhorar os embeddings
+        """
+        # Features estatísticas por categoria
+        category_stats = pd.DataFrame({
+            'category': categorical_series,
+            'target': target_series
+        }).groupby('category')['target'].agg([
+            'mean', 'std', 'count', 'median',
+            lambda x: np.percentile(x, 25),  # Q1
+            lambda x: np.percentile(x, 75),  # Q3
+        ]).fillna(0)
+        
+        # Mapear de volta para cada registro
+        context_features = []
+        for cat in categorical_series:
+            if cat in category_stats.index:
+                context_features.append(category_stats.loc[cat].values)
+            else:
+                context_features.append(np.zeros(6))  # 6 estatísticas
+        
+        return np.array(context_features)
+    
+    def _create_pca_embeddings(self, categorical_series, n_unique, embedding_dim):
+        """
+        Método PCA como fallback quando TensorFlow não está disponível
+        """
+        # Criar matriz de embeddings simples (baseada em frequência e co-ocorrência)
+        embedding_matrix = self._create_simple_embeddings(categorical_series, n_unique)
+        
+        # Aplicar PCA
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=min(embedding_dim, n_unique-1))
+        reduced_embeddings = pca.fit_transform(embedding_matrix)
+        
+        # Mapear de volta para os dados
+        le = LabelEncoder()
+        encoded_values = le.fit_transform(categorical_series.fillna('outros'))
+        embeddings = reduced_embeddings[encoded_values]
+        
+        return embeddings, pca, le
+    
+    def apply_autoencoder_embeddings(self, data, col):
+        """
+        Aplica embeddings de autoencoder treinados a novos dados
+        
+        Args:
+            data: DataFrame com novos dados
+            col: Nome da coluna categórica
+        
+        Returns:
+            DataFrame com embeddings aplicados
+        """
+        if col not in self.autoencoder_transformers:
+            print(f"⚠️ Autoencoder para {col} não encontrado, pulando...")
+            return data
+        
+        if not TENSORFLOW_AVAILABLE:
+            print(f"⚠️ TensorFlow não disponível para aplicar autoencoder em {col}")
+            return data
+        
+        encoder = self.autoencoder_transformers[col]
+        le = self.label_encoders[col]
+        
+        # Processar dados da mesma forma que no treinamento
+        processed_col = data[col].apply(
+            lambda x: x if x in le.classes_ else 'outros'
+        )
+        
+        # Label encoding
+        try:
+            encoded_labels = le.transform(processed_col.fillna('outros'))
+        except ValueError:
+            # Se houver categorias não vistas, mapear para 'outros'
+            encoded_labels = []
+            for val in processed_col.fillna('outros'):
+                if val in le.classes_:
+                    encoded_labels.append(le.transform([val])[0])
+                else:
+                    encoded_labels.append(le.transform(['outros'])[0])
+            encoded_labels = np.array(encoded_labels)
+        
+        # One-hot encoding
+        n_unique = len(le.classes_)
+        one_hot_input = to_categorical(encoded_labels, num_classes=n_unique)
+        
+        # Features contextuais (usar médias de treino como fallback)
+        context_features = self._create_context_features_inference(processed_col, data.get('qty', None))
+        
+        # Combinar dados
+        X_input = np.concatenate([one_hot_input, context_features], axis=1)
+        
+        # Aplicar encoder
+        embeddings = encoder.predict(X_input, verbose=0)
+        
+        # Adicionar embeddings ao DataFrame
+        for i in range(embeddings.shape[1]):
+            data[f'{col}_ae_{i}'] = embeddings[:, i]
+        
+        return data
+    
+    def _create_context_features_inference(self, categorical_series, target_series=None):
+        """
+        Cria features contextuais para inferência (sem vazamento de dados)
+        """
+        if target_series is None:
+            # Usar estatísticas globais como fallback
+            context_features = np.zeros((len(categorical_series), 6))
+        else:
+            context_features = self._create_context_features(categorical_series, target_series)
+        
+        return context_features
+
     def _create_simple_embeddings(self, categorical_series, n_unique):
         """Cria embeddings simples baseados em frequência e co-ocorrência"""
         # Matriz simples: cada linha é uma categoria, colunas são features estatísticas

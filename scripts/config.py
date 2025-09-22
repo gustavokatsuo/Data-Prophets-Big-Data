@@ -34,22 +34,33 @@ TRAINING_PARAMS = {
 LAG_FEATURES = [1, 2, 3, 4, 8, 12]
 
 # Features categóricas para dummização
-DUMMY_FEATURES = ['categoria', 'premise']
+DUMMY_FEATURES = ['categoria', 'premise', 'tipos', 'label']
 
 # Features categóricas para embedding
-EMBEDDING_FEATURES = ['subcategoria', 'tipos', 'label', 'fabricante']
+EMBEDDING_FEATURES = ['subcategoria', 'fabricante', 'descricao', 'marca']
 
-# Configurações de embedding
+# Configurações de embedding com Autoencoders OTIMIZADAS
 EMBEDDING_CONFIG = {
-    'n_components': 10,  # Número de componentes PCA para embeddings
-    'max_unique_values': 100,  # Máximo de valores únicos antes de aplicar redução
-    'min_frequency': 5  # Frequência mínima para manter uma categoria
+    'n_components': 8,  # Reduzido para economizar memória
+    'max_unique_values': 100,  # Aumentado - agora suporta mais categorias eficientemente
+    'min_frequency': 10,  # Aumentado para reduzir categorias raras
+    'autoencoder_params': {
+        'embedding_dim': 8,     # Reduzido para economizar memória
+        'epochs': 50,           # Reduzido para treino mais rápido
+        'batch_size': 128,      # Aumentado para eficiência
+        'learning_rate': 0.002, # Ligeiramente aumentado
+        'validation_split': 0.0, # Removido para economizar memória
+        'early_stopping_patience': 8,  # Reduzido
+        'encoder_layers': [32],         # Arquitetura muito mais leve
+        'decoder_layers': [32],         # Arquitetura muito mais leve
+        'max_samples_per_category': 100 # Novo: limita amostras por categoria
+    }
 }
 
 # Divisão temporal
 TRAIN_CUTOFF = 44  # Semanas <= 44 para treino
-VALID_START = 45   # Semanas 45-48 para validação
-VALID_END = 48
+VALID_START = 45   # Semanas 45-52 para validação
+VALID_END = 52
 
 # Predições
 PREDICTION_WEEKS = [1, 2, 3, 4, 5]  # Janeiro 2023

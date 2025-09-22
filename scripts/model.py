@@ -112,6 +112,7 @@ def _predict_single_fast(pdv, sku, hist_data, model, feature_columns, weeks, cat
                 qty_values = qty_values[-20:]
         
         return predictions
+    
     except Exception as e:
         return []
 
@@ -121,119 +122,6 @@ def _process_prediction_chunk(chunk_args):
     # Usar a nova função de batch otimizada
     return _predict_batch_optimized(chunk_data, model, feature_columns, weeks)
 
-def _predict_single_optimized_static(pdv, sku, hist_data, model, feature_columns, weeks):
-    """Versão estática otimizada de predição para uma combinação"""
-    try:
-        predictions = []
-        current_data = hist_data.copy()
-        
-        for week in weeks:
-            features = _calculate_features_fast_static(current_data)
-            
-            if features is not None and len(features) == len(feature_columns):
-                pred = model.predict(np.array([features]))[0]
-                pred = max(0, pred)
-                
-                predictions.append({
-                    'pdv': pdv,
-                    'internal_product_id': sku,
-                    'week': week,
-                    'predicted_qty': pred
-                })
-                
-                new_row = pd.DataFrame({
-                    'week_of_year': [current_data['week_of_year'].max() + 1],
-                    'pdv': [pdv], 'internal_product_id': [sku], 'qty': [pred]
-                })
-                
-                # Copiar features categóricas do último registro
-                last_row = current_data.iloc[-1]
-                for col in current_data.columns:
-                    if (col.startswith(('categoria_', 'premise_')) or 
-                        col.endswith(('_target_enc', '_emb_0', '_emb_1', '_emb_2', '_emb_3', '_emb_4', 
-                                     '_emb_5', '_emb_6', '_emb_7', '_emb_8', '_emb_9')) or
-                        col in ['categoria', 'premise', 'subcategoria', 'tipos', 'label', 'fabricante']):
-                        if col not in new_row.columns:
-                            new_row[col] = last_row[col]
-                
-                current_data = pd.concat([current_data, new_row], ignore_index=True)
-                
-                if len(current_data) > 20:
-                    current_data = current_data.tail(20)
-        return predictions
-    
-    except Exception as e:
-        print(f"--- ERRO ao prever para PDV {pdv}, SKU {sku}: {e} ---")
-        traceback.print_exc()
-        return []
-    
-def _calculate_features_fast_static(data):
-    """Calcula features de forma otimizada usando numpy (versão estática)"""
-    try:
-        if len(data) < 1:
-            return None
-            
-        qty_values = data['qty'].values
-        current_week = data['week_of_year'].iloc[-1] + 1
-        
-        features = [current_week]
-        
-        # Lags otimizados com numpy indexing
-        lag_indices = np.array([1, 2, 3, 4, 8, 12])
-        n_vals = len(qty_values)
-        lag_values = np.zeros(len(lag_indices))
-        
-        # Usar indexing vetorizado para lags válidos
-        valid_lags = lag_indices <= n_vals
-        if np.any(valid_lags):
-            valid_indices = lag_indices[valid_lags]
-            lag_values[valid_lags] = qty_values[-valid_indices]
-        
-        features.extend(lag_values.tolist())
-
-        # Dados para rolling (todos exceto o mais recente) - otimizado
-        rolling_data = qty_values[:-1] if len(qty_values) > 1 else qty_values
-
-        # Rolling means/std sobre os últimos 4 pontos *do passado* - vetorizado
-        if len(rolling_data) >= 4:
-            window = rolling_data[-4:]
-            features.extend([np.mean(window), np.std(window)])  # rmean_4, rstd_4
-        else: # Se não houver dados suficientes, usar a média/std de tudo que tiver
-            if len(rolling_data) > 0:
-                mean_val = np.mean(rolling_data)
-                std_val = np.std(rolling_data) if len(rolling_data) > 1 else 0.0
-                features.extend([mean_val, std_val])
-            else:
-                features.extend([0.0, 0.0])
-        
-        # Fração de não zeros sobre os últimos 8 pontos *do passado* - vetorizado
-        if len(rolling_data) >= 8:
-            features.append(np.mean(rolling_data[-8:] > 0))  # nonzero_frac_8
-        else:
-            features.append(np.mean(rolling_data > 0) if len(rolling_data) > 0 else 0.0)
-        
-        features.append(qty_values[-1] * 10 if len(qty_values) > 0 else 0)
-        
-        # Adicionar features categóricas do último registro (vetorizado)
-        # Estas features são constantes para cada combinação PDV-produto
-        last_row = data.iloc[-1]
-        
-        # Features dummy - usar mask vetorizada
-        dummy_cols = [col for col in data.columns if col.startswith(('categoria_', 'premise_'))]
-        features.extend(last_row[dummy_cols].values if dummy_cols else [])
-        
-        # Features de embedding - usar mask vetorizada
-        emb_cols = [col for col in data.columns if col.endswith(('_target_enc', '_emb_0', '_emb_1', '_emb_2', '_emb_3', '_emb_4', 
-                           '_emb_5', '_emb_6', '_emb_7', '_emb_8', '_emb_9'))]
-        features.extend(last_row[emb_cols].values if emb_cols else [])
-        
-        return features
-        
-    except Exception as e:
-        # Também podemos adicionar depuração aqui se necessário
-        print(f"--- ERRO em _calculate_features_fast_static: {e} ---")
-        return None
-    
 class LightGBMModel:
     """Classe para treinamento e predição com LightGBM"""
     

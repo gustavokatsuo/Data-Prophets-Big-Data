@@ -132,11 +132,11 @@ def main():
     print("📈 RESUMO DOS RESULTADOS:")
     print(f"• Total de predições: {len(predictions_df):,}")
     print(f"• PDVs únicos: {predictions_df['pdv'].nunique():,}")
-    print(f"• Produtos únicos: {predictions_df['internal_product_id'].nunique():,}")
+    print(f"• Produtos únicos: {predictions_df['produto'].nunique():,}")
     print(f"• WMAPE do modelo: {wmape:.4f}")
     
     # Estatísticas por semana
-    pred_stats = predictions_df.groupby('week')['predicted_qty'].sum()
+    pred_stats = predictions_df.groupby('semana')['quantidade'].sum()
     print("\n🔮 PREDIÇÕES POR SEMANA:")
     for week in PREDICTION_WEEKS:
         if week in pred_stats.index:
